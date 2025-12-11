@@ -376,4 +376,44 @@ npm run bot:start
 ## Related Files
 
 - `UIPLAN.md` - Detailed UI architecture, component specs, and implementation patterns
+- `CROSSCHAIN_CONTEXT.md` - Cross-chain implementation guide (Ethereum, relay chains)
+- `CROSSCHAIN_PLAN.md` - Full cross-chain architecture and research findings
 - `README.md` - User-facing documentation and setup guide
+
+## Cross-Chain Extension (Planned)
+
+> See `CROSSCHAIN_CONTEXT.md` for implementation details.
+
+The toolkit is being extended to support pools from **any EVM chain**:
+
+| Source Chain | Flow | Trust Model |
+|--------------|------|-------------|
+| Flare, Ethereum | Direct | Trustless (FDC) |
+| Arbitrum, Base, OP, Polygon | Relay | Bot + FDC |
+
+### Schema Evolution (v1.0.0 → v2.0.0)
+
+**Backward compatible** - legacy feeds continue to work:
+
+```typescript
+// Normalize legacy feeds when reading
+const sourceChain = feed.sourceChain ?? { id: 14, name: 'Flare', category: 'direct' };
+const poolAddress = feed.sourcePoolAddress ?? feed.poolAddress;
+```
+
+New fields in v2.0.0:
+- `sourceChain: { id, name, category }` - Where the pool lives
+- `sourcePoolAddress` - Pool address on source chain
+- `priceRelayAddress` - For relay chains only
+
+### FDC Multi-Chain Support
+
+The FDC client will be extended to support multiple source IDs:
+
+```javascript
+const SOURCE_IDS = {
+  14: '0x464c52...',    // FLR
+  1: '0x455448...',     // ETH
+  11155111: '0x746573...' // Sepolia (testnet)
+};
+```

@@ -68,6 +68,10 @@ const STEP_PROGRESS: Record<UpdateStep, number> = {
   'enabling-pool': 10,
   recording: 15,
   'switching-to-flare': 25,
+  // Relay-specific steps
+  'fetching-price': 10,
+  'relaying-price': 20,
+  // Common steps
   'requesting-attestation': 30,
   'waiting-finalization': 50,
   'retrieving-proof': 80,
@@ -118,6 +122,7 @@ function FeedCard({ feed, chainId, onUpdateClick, isUpdating, normalizedFeed }: 
   const botStatus = getBotStatus(lastUpdateTimestamp);
   const sourceChain = normalizedFeed.sourceChain;
   const isFlareSource = sourceChain.id === 14 || sourceChain.id === 114;
+  const isRelayFeed = sourceChain.category === 'relay';
 
   const statusConfig = {
     active: { color: 'bg-green-500', text: 'Active', icon: CheckCircle2 },
@@ -151,6 +156,12 @@ function FeedCard({ feed, chainId, onUpdateClick, isUpdating, normalizedFeed }: 
                   <ArrowRight className="w-3 h-3" />
                   <span>Flare</span>
                 </div>
+              )}
+              {/* Relay trust indicator */}
+              {isRelayFeed && (
+                <Badge variant="outline" className="text-[10px] bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                  Relay
+                </Badge>
               )}
             </div>
           </div>
@@ -325,12 +336,14 @@ function UpdateProgressModal({
   isOpen,
   progress,
   onCancel,
+  onRetryAttestation,
   feedAddress,
   sourceChainName,
 }: {
   isOpen: boolean;
   progress: { step: UpdateStep; message: string; elapsed?: number; error?: string; txHash?: string };
   onCancel: () => void;
+  onRetryAttestation?: () => void;
   feedAddress?: string;
   sourceChainName?: string;
 }) {
@@ -339,6 +352,11 @@ function UpdateProgressModal({
   const progressValue = STEP_PROGRESS[progress.step];
   const isError = progress.step === 'error';
   const isSuccess = progress.step === 'success';
+  const canRetryAttestation =
+    isError &&
+    !!progress.txHash &&
+    /verifier returned status/i.test(progress.message) &&
+    /INVALID/i.test(progress.message);
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
@@ -391,6 +409,20 @@ function UpdateProgressModal({
             </div>
           )}
 
+          {progress.step === 'fetching-price' && (
+            <div className="p-3 rounded-lg bg-yellow-50 dark:bg-yellow-950 text-xs text-muted-foreground">
+              <p className="font-medium mb-1">📡 Relay Mode</p>
+              <p>Fetching price data from {sourceChainName} via relay. No wallet action needed for this step.</p>
+            </div>
+          )}
+
+          {progress.step === 'relaying-price' && (
+            <div className="p-3 rounded-lg bg-yellow-50 dark:bg-yellow-950 text-xs text-muted-foreground">
+              <p className="font-medium mb-1">📤 Relaying Price to Flare</p>
+              <p>Please confirm the relay transaction in your wallet. This submits the price to the PriceRelay contract on Flare.</p>
+            </div>
+          )}
+
           {progress.step === 'waiting-finalization' && (
             <div className="p-3 rounded-lg bg-secondary/50 text-xs text-muted-foreground">
               <p className="font-medium mb-1">⏱️ FDC Finalization</p>
@@ -405,13 +437,24 @@ function UpdateProgressModal({
           )}
 
           {(isSuccess || isError) && (
-            <Button 
-              className="w-full" 
-              onClick={onCancel}
-              variant={isError ? 'destructive' : 'default'}
-            >
-              {isError ? 'Close' : 'Done'}
-            </Button>
+            <div className="grid gap-2">
+              {canRetryAttestation && onRetryAttestation && (
+                <Button
+                  className="w-full"
+                  onClick={onRetryAttestation}
+                  variant="secondary"
+                >
+                  Retry attestation (no new record tx)
+                </Button>
+              )}
+              <Button 
+                className="w-full" 
+                onClick={onCancel}
+                variant={isError ? 'destructive' : 'default'}
+              >
+                {isError ? 'Close' : 'Done'}
+              </Button>
+            </div>
           )}
         </CardContent>
       </Card>
@@ -442,22 +485,32 @@ export default function MonitorPage() {
 
     const normalized = getNormalizedFeed(feed);
     const sourceChainId = normalized.sourceChain.id;
+    const isRelayFeed = normalized.sourceChain.category === 'relay';
 
-    // Find the recorder for this feed
-    const recorder = recorders.find(r => r.address === feed.priceRecorderAddress);
-    if (!recorder) {
-      toast.error('Price recorder not found');
-      return;
+    // For direct chains: need a recorder
+    // For relay chains: need a relay
+    if (isRelayFeed) {
+      if (!feed.priceRelayAddress) {
+        toast.error('Price relay address not found');
+        return;
+      }
+    } else {
+      const recorder = recorders.find(r => r.address === feed.priceRecorderAddress);
+      if (!recorder) {
+        toast.error('Price recorder not found');
+        return;
+      }
     }
 
     setUpdatingFeedId(feed.id);
 
     try {
       await updateFeed(
-        feed.priceRecorderAddress!,
+        feed.priceRecorderAddress,
         normalized.sourcePoolAddress,
         feed.customFeedAddress,
-        sourceChainId
+        sourceChainId,
+        feed.priceRelayAddress  // Pass relay address for relay feeds
       );
       
       // Refresh feeds data after successful update
@@ -476,6 +529,33 @@ export default function MonitorPage() {
     setUpdatingFeedId(null);
   };
 
+  const handleRetryAttestation = async () => {
+    if (!updatingFeedId) return;
+    if (!progress.txHash) {
+      toast.error('No transaction hash to retry');
+      return;
+    }
+
+    const feed = allFeeds.find(f => f.id === updatingFeedId);
+    if (!feed) return;
+
+    const normalized = getNormalizedFeed(feed);
+    const sourceChainId = normalized.sourceChain.id;
+
+    try {
+      await updateFeed(
+        feed.priceRecorderAddress,
+        normalized.sourcePoolAddress,
+        feed.customFeedAddress,
+        sourceChainId,
+        feed.priceRelayAddress,
+        progress.txHash as `0x${string}`
+      );
+    } catch (error) {
+      console.error('Retry attestation failed:', error);
+    }
+  };
+
   return (
     <div className="min-h-screen">
       <Header 
@@ -491,7 +571,7 @@ export default function MonitorPage() {
               {allFeeds.length} Feed{allFeeds.length !== 1 ? 's' : ''} on Flare
             </h2>
             <p className="text-sm text-muted-foreground">
-              Feeds can source prices from Flare, Ethereum, and Sepolia
+              Feeds can source prices from Flare, Ethereum, Arbitrum, Base, Optimism, and Polygon
             </p>
           </div>
           <Button variant="outline" onClick={refresh}>
@@ -544,6 +624,7 @@ export default function MonitorPage() {
         isOpen={updatingFeedId !== null}
         progress={progress}
         onCancel={handleCloseModal}
+        onRetryAttestation={handleRetryAttestation}
         feedAddress={updatingFeed?.customFeedAddress}
         sourceChainName={updatingNormalized?.sourceChain.name}
       />

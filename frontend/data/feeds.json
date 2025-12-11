@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "2.0.0",
   "feeds": [
     {
       "id": "e5d7c585-d75e-441d-bb18-906e483e57dc",
@@ -42,6 +42,60 @@
       "invertPrice": false,
       "deployedAt": "2025-12-10T03:55:40.012Z",
       "deployedBy": "0x5d92A2486042Dd4cEE0BD6B5ffd98a8C3A6EA4Fe"
+    },
+    {
+      "id": "sepolia-weth-usdc-feed",
+      "alias": "WETH_USDC_SEP",
+      "sourceChain": {
+        "id": 11155111,
+        "name": "Sepolia",
+        "category": "direct"
+      },
+      "sourcePoolAddress": "0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50",
+      "network": "flare",
+      "poolAddress": "0x6Ce0896eAE6D4BD668fDe41BB784548fb8F59b50",
+      "customFeedAddress": "0x6E80158Ad31835E43cd7f77C4614d012eCd9Ad1b",
+      "priceRecorderAddress": "0x56f9a359216e0ce5a552fbe382f9fcecea7fc930",
+      "token0": {
+        "address": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
+        "symbol": "WETH",
+        "decimals": 18
+      },
+      "token1": {
+        "address": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+        "symbol": "USDC",
+        "decimals": 6
+      },
+      "invertPrice": false,
+      "deployedAt": "2025-12-11T05:18:00.000Z",
+      "deployedBy": "0x5d92A2486042Dd4cEE0BD6B5ffd98a8C3A6EA4Fe"
+    },
+    {
+      "id": "eth-mainnet-weth-usdc",
+      "alias": "ETH_USDC_UNISWAP",
+      "sourceChain": {
+        "id": 1,
+        "name": "Ethereum",
+        "category": "direct"
+      },
+      "sourcePoolAddress": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+      "network": "flare",
+      "poolAddress": "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",
+      "customFeedAddress": "0x9153FC81332b75219AF5cA89eaaf530AE7D2d221",
+      "priceRecorderAddress": "0x4158CdC115D59D10F1462903f0f0B1Cefc1679B1",
+      "token0": {
+        "address": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "symbol": "USDC",
+        "decimals": 6
+      },
+      "token1": {
+        "address": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+        "symbol": "WETH",
+        "decimals": 18
+      },
+      "invertPrice": true,
+      "deployedAt": "2025-12-11T20:50:00.000Z",
+      "deployedBy": "0x5d92A2486042Dd4cEE0BD6B5ffd98a8C3A6EA4Fe"
     }
   ],
   "recorders": [
@@ -68,6 +122,52 @@
       "updateInterval": 300,
       "deployedAt": "2025-12-10T03:54:50.291Z",
       "deployedBy": "0x5d92A2486042Dd4cEE0BD6B5ffd98a8C3A6EA4Fe"
+    },
+    {
+      "id": "sepolia-recorder-001",
+      "address": "0x8fa2bcd5a1d9d13dc104a0cc607b827ba783140b",
+      "chainId": 11155111,
+      "chainName": "Sepolia",
+      "updateInterval": 300,
+      "deployedAt": "2025-12-11T04:54:00.000Z",
+      "deployedBy": "0x5d92A2486042Dd4cEE0BD6B5ffd98a8C3A6EA4Fe"
+    },
+    {
+      "id": "sepolia-recorder-002",
+      "address": "0x6e80158ad31835e43cd7f77c4614d012ecd9ad1b",
+      "chainId": 11155111,
+      "chainName": "Sepolia",
+      "updateInterval": 300,
+      "deployedAt": "2025-12-11T05:01:12.000Z",
+      "deployedBy": "0x5d92A2486042Dd4cEE0BD6B5ffd98a8C3A6EA4Fe"
+    },
+    {
+      "id": "6fbe466d-8a78-448f-9c0d-38f5c08072a7",
+      "address": "0x719c05d4255b0bdf8e80c329169642b711619f73",
+      "chainId": 11155111,
+      "chainName": "Sepolia",
+      "updateInterval": 300,
+      "deployedAt": "2025-12-11T05:06:02.392Z",
+      "deployedBy": "0x5d92A2486042Dd4cEE0BD6B5ffd98a8C3A6EA4Fe"
+    },
+    {
+      "id": "d6668cc0-3083-4e4c-85cd-0389fcb402da",
+      "address": "0x56f9a359216e0ce5a552fbe382f9fcecea7fc930",
+      "chainId": 11155111,
+      "chainName": "Sepolia",
+      "updateInterval": 300,
+      "deployedAt": "2025-12-11T05:17:03.116Z",
+      "deployedBy": "0x5d92A2486042Dd4cEE0BD6B5ffd98a8C3A6EA4Fe"
+    },
+    {
+      "id": "eth-mainnet-recorder",
+      "address": "0x4158CdC115D59D10F1462903f0f0B1Cefc1679B1",
+      "chainId": 1,
+      "chainName": "Ethereum",
+      "updateInterval": 300,
+      "deployedAt": "2025-12-11T20:45:00.000Z",
+      "deployedBy": "0x5d92A2486042Dd4cEE0BD6B5ffd98a8C3A6EA4Fe"
     }
-  ]
+  ],
+  "relays": []
 }

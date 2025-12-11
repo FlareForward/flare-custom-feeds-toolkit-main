@@ -12,7 +12,8 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { useFeeds } from '@/context/feeds-context';
 import { usePoolInfo } from '@/hooks/use-pool-info';
-import { useAccount, useChainId, usePublicClient, useWalletClient, useSwitchChain } from 'wagmi';
+import { useAccount, useChainId, usePublicClient, useWalletClient, useSwitchChain, useConfig } from 'wagmi';
+import { getWalletClient } from 'wagmi/actions';
 import { toast } from 'sonner';
 import { v4 as uuidv4 } from 'uuid';
 import { 
@@ -26,7 +27,7 @@ import {
   Copy,
   Info
 } from 'lucide-react';
-import { getExplorerUrl } from '@/lib/wagmi-config';
+import { getExplorerUrl, flare } from '@/lib/wagmi-config';
 import { ChainSelector, ChainBadge } from '@/components/chain';
 import { getChainById, isDirectChain, getChainExplorerUrl } from '@/lib/chains';
 import type { SourceChain } from '@/lib/types';
@@ -34,27 +35,41 @@ import Link from 'next/link';
 import { PRICE_RECORDER_ABI, PRICE_RECORDER_BYTECODE } from '@/lib/artifacts/PriceRecorder';
 import { POOL_PRICE_CUSTOM_FEED_ABI, POOL_PRICE_CUSTOM_FEED_BYTECODE, CONTRACT_REGISTRY, CONTRACT_REGISTRY_ABI } from '@/lib/artifacts/PoolPriceCustomFeed';
 import { getAddress, createPublicClient, http } from 'viem';
+import { PRICE_RELAY_ABI, PRICE_RELAY_BYTECODE } from '@/lib/artifacts/PriceRelay';
+import { isRelayChain } from '@/lib/chains';
 
 type DeployStep = 'select' | 'configure' | 'review' | 'deploying' | 'success' | 'error';
 
+// Default PriceRelay configuration
+// In production, this should be a deployed contract address
+const DEFAULT_PRICE_RELAY_CONFIG = {
+  minRelayInterval: 60,  // 60 seconds
+  maxPriceAge: 300,      // 5 minutes
+};
+
 export default function DeployPage() {
-  const { recorders, addRecorder, addFeed } = useFeeds();
+  const { recorders, relays, addRecorder, addFeed, addRelay } = useFeeds();
   const { address } = useAccount();
   const chainId = useChainId();
   const publicClient = usePublicClient();
   const { data: walletClient } = useWalletClient();
   const { switchChainAsync } = useSwitchChain();
+  const wagmiConfig = useConfig();
 
   // Source chain selection (NEW)
   const [sourceChainId, setSourceChainId] = useState<number>(14); // Default to Flare
   const sourceChain = getChainById(sourceChainId);
+  const isRelaySourceChain = isRelayChain(sourceChainId);
 
-  // Filter recorders by selected source chain
+  // Filter recorders by selected source chain (only for direct chains)
   const chainRecorders = recorders.filter(r => {
     // Legacy recorders without chainId are assumed to be on Flare
     const recorderChainId = r.chainId ?? 14;
     return recorderChainId === sourceChainId;
   });
+
+  // Get available relays (for relay chains)
+  const availableRelays = relays || [];
 
   // Deploy type selection
   const [deployType, setDeployType] = useState<'recorder' | 'feed' | null>(null);
@@ -65,6 +80,7 @@ export default function DeployPage() {
 
   // Feed config
   const [selectedRecorder, setSelectedRecorder] = useState<string>('');
+  const [selectedRelay, setSelectedRelay] = useState<string>(''); // For relay chains
   const [poolAddress, setPoolAddress] = useState('');
   const [feedAlias, setFeedAlias] = useState('');
   const [invertPrice, setInvertPrice] = useState(false);
@@ -94,6 +110,7 @@ export default function DeployPage() {
     setStep('select');
     setUpdateInterval('300');
     setSelectedRecorder('');
+    setSelectedRelay('');
     setPoolAddress('');
     setFeedAlias('');
     setInvertPrice(false);
@@ -152,14 +169,25 @@ export default function DeployPage() {
       toast.info('Transaction submitted, waiting for confirmation...');
 
       // Create a client for the source chain to wait for receipt
-      const sourceClient = sourceChainId !== chainId && sourceChain 
+      // Always use the source chain's RPC when deploying cross-chain
+      const sourceClient = sourceChain && sourceChainId !== 14
         ? createPublicClient({
+            chain: {
+              id: sourceChain.id,
+              name: sourceChain.name,
+              nativeCurrency: sourceChain.nativeCurrency,
+              rpcUrls: { default: { http: [sourceChain.rpcUrl] } },
+            } as const,
             transport: http(sourceChain.rpcUrl),
           })
         : publicClient;
 
-      // Wait for deployment
-      const receipt = await sourceClient.waitForTransactionReceipt({ hash });
+      // Wait for deployment with timeout and polling config
+      const receipt = await sourceClient.waitForTransactionReceipt({ 
+        hash,
+        timeout: 120_000, // 2 minute timeout
+        pollingInterval: 2_000, // Poll every 2 seconds
+      });
       
       if (!receipt.contractAddress) {
         throw new Error('Contract address not found in receipt');
@@ -192,11 +220,92 @@ export default function DeployPage() {
     }
   };
 
+  // Deploy PriceRelay (for relay chains)
+  const handleDeployRelay = async () => {
+    if (!walletClient || !publicClient || !address) {
+      toast.error('Wallet not connected');
+      return;
+    }
+
+    setStep('deploying');
+    setIsDeploying(true);
+    setError('');
+
+    try {
+      // Relays are always deployed on Flare
+      if (chainId !== 14) {
+        toast.info('Switching to Flare...');
+        try {
+          await switchChainAsync({ chainId: 14 });
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } catch (switchError) {
+          if ((switchError as Error).message?.includes('rejected')) {
+            throw new Error('Network switch rejected');
+          }
+          throw switchError;
+        }
+      }
+
+      toast.info('Deploying PriceRelay on Flare...', {
+        description: `Min interval: ${DEFAULT_PRICE_RELAY_CONFIG.minRelayInterval}s, Max age: ${DEFAULT_PRICE_RELAY_CONFIG.maxPriceAge}s`,
+      });
+
+      // Deploy the PriceRelay contract on Flare
+      const hash = await walletClient.deployContract({
+        abi: PRICE_RELAY_ABI,
+        bytecode: PRICE_RELAY_BYTECODE,
+        args: [
+          BigInt(DEFAULT_PRICE_RELAY_CONFIG.minRelayInterval),
+          BigInt(DEFAULT_PRICE_RELAY_CONFIG.maxPriceAge),
+        ],
+        account: address,
+      });
+
+      setTxHash(hash);
+      toast.info('Transaction submitted, waiting for confirmation...');
+
+      // Wait for deployment
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      
+      if (!receipt.contractAddress) {
+        throw new Error('Contract address not found in receipt');
+      }
+
+      const contractAddress = receipt.contractAddress;
+      setDeployedAddress(contractAddress);
+
+      // Save to local storage
+      addRelay({
+        id: uuidv4(),
+        address: contractAddress as `0x${string}`,
+        minRelayInterval: DEFAULT_PRICE_RELAY_CONFIG.minRelayInterval,
+        maxPriceAge: DEFAULT_PRICE_RELAY_CONFIG.maxPriceAge,
+        supportedChainIds: [42161, 8453, 10, 137], // Default supported chains
+        deployedAt: new Date().toISOString(),
+        deployedBy: address,
+      });
+
+      toast.success('PriceRelay deployed on Flare!');
+      setStep('success');
+
+    } catch (e) {
+      console.error('Deploy error:', e);
+      setError(e instanceof Error ? e.message : 'Deployment failed');
+      setStep('error');
+    } finally {
+      setIsDeploying(false);
+    }
+  };
+
   const handleGoToFeedFromRecorder = () => {
     if (!deployedAddress) return;
     setStep('select');
     setDeployType('feed');
-    setSelectedRecorder(deployedAddress);
+    if (isRelaySourceChain) {
+      setSelectedRelay(deployedAddress);
+    } else {
+      setSelectedRecorder(deployedAddress);
+    }
     setPoolAddress('');
     setFeedAlias('');
     setInvertPrice(false);
@@ -222,6 +331,7 @@ export default function DeployPage() {
 
     try {
       // Feed contracts are ALWAYS deployed on Flare
+      // Switch to Flare if not already on it
       if (chainId !== 14) {
         toast.info('Switching to Flare for feed deployment...');
         try {
@@ -233,6 +343,13 @@ export default function DeployPage() {
           }
           throw switchError;
         }
+      }
+
+      // Get a FRESH wallet client for Flare after switching
+      // This is necessary because the hook's walletClient may still point to the old chain
+      const flareWalletClient = await getWalletClient(wagmiConfig, { chainId: 14 });
+      if (!flareWalletClient) {
+        throw new Error('Failed to get Flare wallet client. Please ensure your wallet is connected to Flare.');
       }
 
       const token0Dec = parseInt(manualToken0Decimals) || poolInfo?.token0Decimals || 18;
@@ -248,8 +365,15 @@ export default function DeployPage() {
         description: 'Querying ContractRegistry...',
       });
 
+      // Create a Flare-specific client for reading from ContractRegistry
+      // This ensures we query Flare even if wallet just switched
+      const flareClient = createPublicClient({
+        chain: flare,
+        transport: http(flare.rpcUrls.default.http[0]),
+      });
+
       // Query the ContractRegistry to get the FdcVerification address
-      const fdcVerificationAddress = await publicClient.readContract({
+      const fdcVerificationAddress = await flareClient.readContract({
         address: registryAddress,
         abi: CONTRACT_REGISTRY_ABI,
         functionName: 'getContractAddressByName',
@@ -269,8 +393,8 @@ export default function DeployPage() {
       const checksummedPool = getAddress(poolAddress);
       const checksummedFdc = getAddress(fdcVerificationAddress);
 
-      // Deploy the PoolPriceCustomFeed contract on Flare
-      const hash = await walletClient.deployContract({
+      // Deploy the PoolPriceCustomFeed contract on Flare using the fresh wallet client
+      const hash = await flareWalletClient.deployContract({
         abi: POOL_PRICE_CUSTOM_FEED_ABI,
         bytecode: POOL_PRICE_CUSTOM_FEED_BYTECODE,
         args: [
@@ -288,8 +412,12 @@ export default function DeployPage() {
       setTxHash(hash);
       toast.info('Transaction submitted, waiting for confirmation...');
 
-      // Wait for deployment on Flare
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      // Wait for deployment on Flare using the Flare client (not the stale publicClient)
+      const receipt = await flareClient.waitForTransactionReceipt({ 
+        hash,
+        timeout: 120_000, // 2 minute timeout
+        pollingInterval: 2_000, // Poll every 2 seconds
+      });
       
       if (!receipt.contractAddress) {
         throw new Error('Contract address not found in receipt');
@@ -302,22 +430,27 @@ export default function DeployPage() {
       const sourceChainData: SourceChain = {
         id: sourceChainId,
         name: sourceChain?.name || 'Unknown',
-        category: 'direct',
+        category: isRelaySourceChain ? 'relay' : 'direct',
       };
 
-      // Save to local storage with cross-chain info
-      addFeed({
+      // Build feed data based on direct vs relay chain
+      const feedData = {
         id: uuidv4(),
         alias: feedAlias,
         // v2.0.0 schema fields
         sourceChain: sourceChainData,
         sourcePoolAddress: poolAddress as `0x${string}`,
         // Legacy fields for backward compatibility
-        network: 'flare', // Feed is always on Flare
+        network: 'flare' as const, // Feed is always on Flare
         poolAddress: poolAddress as `0x${string}`,
         // Flare deployment
         customFeedAddress: contractAddress as `0x${string}`,
-        priceRecorderAddress: selectedRecorder as `0x${string}`,
+        // For direct chains: use priceRecorderAddress
+        // For relay chains: use priceRelayAddress
+        ...(isRelaySourceChain
+          ? { priceRelayAddress: selectedRelay as `0x${string}` }
+          : { priceRecorderAddress: selectedRecorder as `0x${string}` }
+        ),
         // Token info
         token0: {
           address: poolInfo?.token0 || '0x0000000000000000000000000000000000000000' as `0x${string}`,
@@ -332,7 +465,10 @@ export default function DeployPage() {
         invertPrice: invertPrice,
         deployedAt: new Date().toISOString(),
         deployedBy: address,
-      });
+      };
+
+      // Save to local storage with cross-chain info
+      addFeed(feedData);
 
       toast.success('Custom Feed deployed on Flare!');
       setStep('success');
@@ -395,38 +531,78 @@ export default function DeployPage() {
         {/* Step: Select Deploy Type */}
         {step === 'select' && (
           <div className="grid md:grid-cols-2 gap-6">
-            <Card 
-              className={`cursor-pointer transition-all hover:border-brand-500 ${
-                deployType === 'recorder' ? 'border-brand-500 bg-brand-500/5' : ''
-              }`}
-              onClick={() => setDeployType('recorder')}
-            >
-              <CardHeader>
-                <div className="w-12 h-12 rounded-xl bg-brand-500/10 flex items-center justify-center mb-4">
-                  <Database className="w-6 h-6 text-brand-500" />
-                </div>
-                <CardTitle>Price Recorder</CardTitle>
-                <CardDescription>
-                  Deploy a PriceRecorder on {sourceChain?.name || 'the source chain'} to capture pool prices
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-2">
-                <Badge variant="outline">Required first</Badge>
-                {sourceChainId !== 14 && (
-                  <p className="text-xs text-muted-foreground">
-                    Requires {sourceChain?.nativeCurrency.symbol} for deployment
-                  </p>
-                )}
-              </CardContent>
-            </Card>
+            {/* Price Recorder Card - Only shown for direct chains */}
+            {!isRelaySourceChain && (
+              <Card 
+                className={`cursor-pointer transition-all hover:border-brand-500 ${
+                  deployType === 'recorder' ? 'border-brand-500 bg-brand-500/5' : ''
+                }`}
+                onClick={() => setDeployType('recorder')}
+              >
+                <CardHeader>
+                  <div className="w-12 h-12 rounded-xl bg-brand-500/10 flex items-center justify-center mb-4">
+                    <Database className="w-6 h-6 text-brand-500" />
+                  </div>
+                  <CardTitle>Price Recorder</CardTitle>
+                  <CardDescription>
+                    Deploy a PriceRecorder on {sourceChain?.name || 'the source chain'} to capture pool prices
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  <Badge variant="outline">Required first</Badge>
+                  {sourceChainId !== 14 && (
+                    <p className="text-xs text-muted-foreground">
+                      Requires {sourceChain?.nativeCurrency.symbol} for deployment
+                    </p>
+                  )}
+                </CardContent>
+              </Card>
+            )}
 
+            {/* Price Relay Card - Only shown for relay chains */}
+            {isRelaySourceChain && (
+              <Card 
+                className={`cursor-pointer transition-all hover:border-brand-500 ${
+                  deployType === 'recorder' ? 'border-brand-500 bg-brand-500/5' : ''
+                }`}
+                onClick={() => setDeployType('recorder')}
+              >
+                <CardHeader>
+                  <div className="w-12 h-12 rounded-xl bg-yellow-500/10 flex items-center justify-center mb-4">
+                    <Database className="w-6 h-6 text-yellow-500" />
+                  </div>
+                  <CardTitle>Price Relay</CardTitle>
+                  <CardDescription>
+                    Deploy a PriceRelay on Flare to receive prices from {sourceChain?.name || 'relay chains'}
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-2">
+                  <Badge variant="outline" className="bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                    Relay Mode
+                  </Badge>
+                  <p className="text-xs text-muted-foreground">
+                    Only requires FLR for deployment on Flare
+                  </p>
+                </CardContent>
+              </Card>
+            )}
+
+            {/* Custom Feed Card - works for both direct and relay chains */}
             <Card 
               className={`cursor-pointer transition-all ${
-                chainRecorders.length === 0 
+                (!isRelaySourceChain && chainRecorders.length === 0) || (isRelaySourceChain && availableRelays.length === 0)
                   ? 'opacity-50 cursor-not-allowed' 
                   : 'hover:border-brand-500'
               } ${deployType === 'feed' ? 'border-brand-500 bg-brand-500/5' : ''}`}
-              onClick={() => chainRecorders.length > 0 && setDeployType('feed')}
+              onClick={() => {
+                if (isRelaySourceChain) {
+                  // For relay chains, allow feed creation if we have a relay
+                  if (availableRelays.length > 0) setDeployType('feed');
+                } else {
+                  // For direct chains, require a recorder
+                  if (chainRecorders.length > 0) setDeployType('feed');
+                }
+              }}
             >
               <CardHeader>
                 <div className="w-12 h-12 rounded-xl bg-brand-500/10 flex items-center justify-center mb-4">
@@ -438,18 +614,28 @@ export default function DeployPage() {
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                {chainRecorders.length === 0 ? (
-                  <Badge variant="secondary">Deploy recorder on {sourceChain?.name} first</Badge>
+                {isRelaySourceChain ? (
+                  availableRelays.length === 0 ? (
+                    <Badge variant="secondary">Deploy relay first</Badge>
+                  ) : (
+                    <Badge variant="outline" className="bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                      Uses relay ({availableRelays.length} available)
+                    </Badge>
+                  )
                 ) : (
-                  <Badge variant="outline">{chainRecorders.length} recorder(s) on {sourceChain?.name}</Badge>
+                  chainRecorders.length === 0 ? (
+                    <Badge variant="secondary">Deploy recorder on {sourceChain?.name} first</Badge>
+                  ) : (
+                    <Badge variant="outline">{chainRecorders.length} recorder(s) on {sourceChain?.name}</Badge>
+                  )
                 )}
               </CardContent>
             </Card>
           </div>
         )}
 
-        {/* Recorder Configuration */}
-        {step === 'select' && deployType === 'recorder' && (
+        {/* Recorder Configuration (Direct Chains) */}
+        {step === 'select' && deployType === 'recorder' && !isRelaySourceChain && (
           <Card>
             <CardHeader>
               <div className="flex items-center gap-2">
@@ -502,6 +688,63 @@ export default function DeployPage() {
           </Card>
         )}
 
+        {/* Relay Configuration (Relay Chains) */}
+        {step === 'select' && deployType === 'recorder' && isRelaySourceChain && (
+          <Card>
+            <CardHeader>
+              <div className="flex items-center gap-2">
+                <CardTitle>Configure Price Relay</CardTitle>
+                <Badge variant="outline" className="bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                  Relay Mode
+                </Badge>
+              </div>
+              <CardDescription>
+                This contract will be deployed on Flare to receive relayed prices from {sourceChain?.name}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {/* Relay trust model info */}
+              <Alert className="bg-yellow-50 border-yellow-200 dark:bg-yellow-950 dark:border-yellow-900">
+                <AlertCircle className="h-4 w-4 text-yellow-600" />
+                <AlertDescription className="text-sm">
+                  <strong>Relay Trust Model:</strong> Prices from {sourceChain?.name} are fetched by a trusted 
+                  relayer bot and submitted to this contract on Flare. The relayer is trusted to report accurate data.
+                </AlertDescription>
+              </Alert>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label>Min Relay Interval</Label>
+                  <div className="p-3 rounded-lg bg-secondary/50">
+                    <p className="font-medium">{DEFAULT_PRICE_RELAY_CONFIG.minRelayInterval}s</p>
+                    <p className="text-xs text-muted-foreground">Minimum time between relays</p>
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label>Max Price Age</Label>
+                  <div className="p-3 rounded-lg bg-secondary/50">
+                    <p className="font-medium">{DEFAULT_PRICE_RELAY_CONFIG.maxPriceAge}s</p>
+                    <p className="text-xs text-muted-foreground">Maximum age of source data</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-3">
+                <Button variant="outline" onClick={handleReset}>
+                  Cancel
+                </Button>
+                <Button 
+                  className="bg-yellow-500 hover:bg-yellow-600 text-black"
+                  onClick={handleDeployRelay}
+                >
+                  <Rocket className="w-4 h-4 mr-2" />
+                  Deploy Relay on Flare
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         {/* Feed Configuration */}
         {step === 'select' && deployType === 'feed' && (
           <Card>
@@ -509,14 +752,27 @@ export default function DeployPage() {
               <div className="flex items-center gap-2">
                 <CardTitle>Configure Custom Feed</CardTitle>
                 <Badge variant="outline">Feed on Flare</Badge>
+                {isRelaySourceChain && (
+                  <Badge variant="outline" className="bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                    Relay
+                  </Badge>
+                )}
               </div>
               <CardDescription>
-                Pool on {sourceChain?.name} → Feed on Flare (FDC verified)
+                Pool on {sourceChain?.name} → Feed on Flare ({isRelaySourceChain ? 'Relay + FDC' : 'FDC'} verified)
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
-              {/* Info about cross-chain flow */}
-              {sourceChainId !== 14 && (
+              {/* Info about cross-chain flow - Different messaging for direct vs relay */}
+              {isRelaySourceChain ? (
+                <Alert className="bg-yellow-50 border-yellow-200 dark:bg-yellow-950 dark:border-yellow-900">
+                  <AlertCircle className="h-4 w-4 text-yellow-600" />
+                  <AlertDescription className="text-sm">
+                    <strong>Relay Flow:</strong> A trusted relayer fetches prices from {sourceChain?.name} 
+                    and submits them to Flare. Updates only require FLR — no {sourceChain?.nativeCurrency.symbol} needed.
+                  </AlertDescription>
+                </Alert>
+              ) : sourceChainId !== 14 && (
                 <Alert className="bg-blue-50 border-blue-200 dark:bg-blue-950 dark:border-blue-900">
                   <Info className="h-4 w-4 text-blue-600" />
                   <AlertDescription className="text-sm">
@@ -526,22 +782,40 @@ export default function DeployPage() {
                 </Alert>
               )}
 
-              {/* Recorder Selection */}
-              <div className="space-y-2">
-                <Label>Price Recorder on {sourceChain?.name}</Label>
-                <select
-                  className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
-                  value={selectedRecorder}
-                  onChange={(e) => setSelectedRecorder(e.target.value)}
-                >
-                  <option value="">Select a recorder...</option>
-                  {chainRecorders.map((r) => (
-                    <option key={r.id} value={r.address}>
-                      {r.address.slice(0, 10)}...{r.address.slice(-8)} (interval: {r.updateInterval}s)
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {/* Recorder/Relay Selection */}
+              {isRelaySourceChain ? (
+                <div className="space-y-2">
+                  <Label>Price Relay on Flare</Label>
+                  <select
+                    className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
+                    value={selectedRelay}
+                    onChange={(e) => setSelectedRelay(e.target.value)}
+                  >
+                    <option value="">Select a relay...</option>
+                    {availableRelays.map((r) => (
+                      <option key={r.id} value={r.address}>
+                        {r.address.slice(0, 10)}...{r.address.slice(-8)} (interval: {r.minRelayInterval}s)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <Label>Price Recorder on {sourceChain?.name}</Label>
+                  <select
+                    className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
+                    value={selectedRecorder}
+                    onChange={(e) => setSelectedRecorder(e.target.value)}
+                  >
+                    <option value="">Select a recorder...</option>
+                    {chainRecorders.map((r) => (
+                      <option key={r.id} value={r.address}>
+                        {r.address.slice(0, 10)}...{r.address.slice(-8)} (interval: {r.updateInterval}s)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
 
               {/* Pool Address */}
               <div className="space-y-2">
@@ -644,12 +918,16 @@ export default function DeployPage() {
                   Cancel
                 </Button>
                 <Button 
-                  className="bg-brand-500 hover:bg-brand-600"
+                  className={isRelaySourceChain ? "bg-yellow-500 hover:bg-yellow-600 text-black" : "bg-brand-500 hover:bg-brand-600"}
                   onClick={handleDeployFeed}
-                  disabled={!selectedRecorder || !poolAddress || !feedAlias}
+                  disabled={
+                    (isRelaySourceChain ? !selectedRelay : !selectedRecorder) || 
+                    !poolAddress || 
+                    !feedAlias
+                  }
                 >
                   <Rocket className="w-4 h-4 mr-2" />
-                  Deploy Feed on Flare
+                  Deploy {isRelaySourceChain ? 'Relay ' : ''}Feed on Flare
                 </Button>
               </div>
             </CardContent>

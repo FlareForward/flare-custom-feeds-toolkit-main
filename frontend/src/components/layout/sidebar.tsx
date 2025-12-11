@@ -12,15 +12,18 @@ import {
   Activity, 
   Settings, 
   AlertTriangle,
-  ArrowLeft, 
+  ArrowLeft,
+  Bot,
 } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
+import { getChainById } from '@/lib/chains';
 
 const navItems = [
   { href: '/dashboard', label: 'Overview', icon: Home },
   { href: '/dashboard/deploy', label: 'Deploy', icon: Rocket },
   { href: '/dashboard/monitor', label: 'Monitor', icon: Activity },
+  { href: '/dashboard/bot', label: 'Bot', icon: Bot },
   { href: '/dashboard/settings', label: 'Settings', icon: Settings },
 ];
 
@@ -29,6 +32,12 @@ export function Sidebar() {
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
   const { data: balance } = useBalance({ address });
+
+  const activeChain = getChainById(chainId);
+  const nativeSymbol = activeChain?.nativeCurrency.symbol || balance?.symbol || 'FLR';
+  const chainLabel = activeChain
+    ? `${activeChain.name}${activeChain.category === 'relay' ? ' (Relay)' : ''}`
+    : `Unsupported chain (${chainId})`;
 
   const formattedBalance = balance 
     ? parseFloat(formatEther(balance.value)).toFixed(4)
@@ -113,7 +122,7 @@ export function Sidebar() {
               isCriticalBalance && "text-destructive",
               isLowBalance && !isCriticalBalance && "text-warning"
             )}>
-              {formattedBalance} {balance?.symbol || 'FLR'}
+              {formattedBalance} {nativeSymbol}
             </span>
           </div>
 
@@ -128,7 +137,7 @@ export function Sidebar() {
               <AlertTriangle className="w-3 h-3 shrink-0" />
               <span>
                 {isCriticalBalance 
-                  ? "Critical: Add FLR to continue"
+                  ? `Critical: Add ${nativeSymbol} to continue`
                   : "Low balance warning"
                 }
               </span>
@@ -145,7 +154,7 @@ export function Sidebar() {
 
           {/* Network Badge */}
           <Badge variant="outline" className="w-full justify-center">
-            {chainId === 14 ? 'Flare Mainnet' : `Unsupported chain (${chainId})`}
+            {chainLabel}
           </Badge>
         </div>
       )}

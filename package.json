@@ -13,6 +13,8 @@
     "bot:start": "node src/custom-feeds-bot.js",
     "test:record": "hardhat run scripts/test-record-price.js --network flare",
     "test:feed": "node scripts/test-feed-read.js",
+    "test:backend": "node scripts/test-backend-eth-to-flare.js",
+    "deploy:crosschain": "node scripts/deploy-crosschain-eth-to-flare.js",
     "clean": "rm -rf artifacts cache"
   },
   "keywords": [

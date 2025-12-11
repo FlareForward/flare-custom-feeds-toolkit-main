@@ -45,7 +45,7 @@ export const SUPPORTED_CHAINS: SupportedChain[] = [
     category: 'direct',
     sourceId: '0x7465737445544800000000000000000000000000000000000000000000000000', // testETH
     verifierPath: 'sepolia',
-    rpcUrl: 'https://rpc.sepolia.org',
+    rpcUrl: 'https://ethereum-sepolia-rpc.publicnode.com',
     explorerUrl: 'https://sepolia.etherscan.io',
     nativeCurrency: { name: 'Sepolia ETH', symbol: 'ETH', decimals: 18 },
     testnet: true,
@@ -108,9 +108,14 @@ export function getRelayChains(): SupportedChain[] {
   return SUPPORTED_CHAINS.filter(c => c.category === 'relay');
 }
 
-// Phase 1: Only return direct chains for selection
+// Phase 3: Return all supported chains for selection (direct + relay)
 export function getSelectableChains(includeTestnets = true): SupportedChain[] {
-  return getDirectChains(includeTestnets);
+  return SUPPORTED_CHAINS.filter(c => includeTestnets || !c.testnet);
+}
+
+// Get all chains (alias for getSelectableChains with all options)
+export function getAllChains(includeTestnets = true): SupportedChain[] {
+  return getSelectableChains(includeTestnets);
 }
 
 // Get chain explorer URL for address or transaction

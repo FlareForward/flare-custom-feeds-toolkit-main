@@ -42,7 +42,7 @@ export const sepolia = {
   name: 'Sepolia',
   nativeCurrency: { name: 'Sepolia ETH', symbol: 'ETH', decimals: 18 },
   rpcUrls: {
-    default: { http: ['https://rpc.sepolia.org'] },
+    default: { http: ['https://ethereum-sepolia-rpc.publicnode.com'] },
   },
   blockExplorers: {
     default: { name: 'Sepolia Etherscan', url: 'https://sepolia.etherscan.io' },

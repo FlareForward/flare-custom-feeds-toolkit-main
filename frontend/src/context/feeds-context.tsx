@@ -4,7 +4,8 @@ import { createContext, useContext, useState, useEffect, useCallback, type React
 import type { 
   FeedsData, 
   StoredFeed, 
-  StoredRecorder, 
+  StoredRecorder,
+  StoredRelay,
   NetworkId,
   SourceChain,
 } from '@/lib/types';
@@ -12,12 +13,15 @@ import type {
 interface FeedsContextType {
   feeds: StoredFeed[];
   recorders: StoredRecorder[];
+  relays: StoredRelay[];
   isLoading: boolean;
   error: Error | null;
   addFeed: (feed: StoredFeed) => Promise<void>;
   removeFeed: (id: string) => Promise<void>;
   addRecorder: (recorder: StoredRecorder) => Promise<void>;
   removeRecorder: (id: string) => Promise<void>;
+  addRelay: (relay: StoredRelay) => Promise<void>;
+  removeRelay: (id: string) => Promise<void>;
   refresh: () => Promise<void>;
   // Legacy helpers (for backward compatibility)
   getFeedsByNetwork: (network: NetworkId) => StoredFeed[];
@@ -31,7 +35,7 @@ interface FeedsContextType {
 const FeedsContext = createContext<FeedsContextType | null>(null);
 
 export function FeedsProvider({ children }: { children: ReactNode }) {
-  const [data, setData] = useState<FeedsData>({ version: '1.0.0', feeds: [], recorders: [] });
+  const [data, setData] = useState<FeedsData>({ version: '2.0.0', feeds: [], recorders: [], relays: [] });
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
 
@@ -89,6 +93,25 @@ export function FeedsProvider({ children }: { children: ReactNode }) {
   const removeRecorder = async (id: string) => {
     const res = await fetch(`/api/feeds?id=${id}&type=recorder`, { method: 'DELETE' });
     if (!res.ok) throw new Error('Failed to remove recorder');
+    await refresh();
+  };
+
+  const addRelay = async (relay: StoredRelay) => {
+    const res = await fetch('/api/feeds', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: 'relay', ...relay }),
+    });
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.error || 'Failed to add relay');
+    }
+    await refresh();
+  };
+
+  const removeRelay = async (id: string) => {
+    const res = await fetch(`/api/feeds?id=${id}&type=relay`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('Failed to remove relay');
     await refresh();
   };
 
@@ -166,12 +189,15 @@ export function FeedsProvider({ children }: { children: ReactNode }) {
       value={{
         feeds: data.feeds,
         recorders: data.recorders,
+        relays: data.relays || [],
         isLoading,
         error,
         addFeed,
         removeFeed,
         addRecorder,
         removeRecorder,
+        addRelay,
+        removeRelay,
         refresh,
         getFeedsByNetwork,
         getRecordersByNetwork,

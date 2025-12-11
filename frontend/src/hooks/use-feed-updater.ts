@@ -1,10 +1,12 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import { usePublicClient, useWalletClient, useChainId, useSwitchChain } from 'wagmi';
+import { usePublicClient, useWalletClient, useChainId, useSwitchChain, useConfig } from 'wagmi';
+import { getWalletClient } from 'wagmi/actions';
 import { decodeAbiParameters, parseAbiParameters, createPublicClient, http } from 'viem';
-import { getChainById as getSourceChainById, type SupportedChain } from '@/lib/chains';
+import { getChainById as getSourceChainById, isRelayChain, type SupportedChain } from '@/lib/chains';
 import { flare, ethereum, sepolia } from '@/lib/wagmi-config';
+import { PRICE_RELAY_ABI } from '@/lib/artifacts/PriceRelay';
 
 // FDC Contract Addresses (on Flare)
 const FDC_CONFIG = {
@@ -214,6 +216,10 @@ export type UpdateStep =
   | 'enabling-pool'
   | 'recording'
   | 'switching-to-flare'
+  // Relay-specific steps
+  | 'fetching-price'
+  | 'relaying-price'
+  // Common steps
   | 'requesting-attestation'
   | 'waiting-finalization'
   | 'retrieving-proof'
@@ -231,10 +237,12 @@ interface UpdateProgress {
 
 interface UseFeedUpdaterResult {
   updateFeed: (
-    priceRecorderAddress: `0x${string}`,
+    priceRecorderAddress: `0x${string}` | undefined,
     poolAddress: `0x${string}`,
     feedAddress: `0x${string}`,
-    sourceChainId?: number  // NEW: optional source chain ID
+    sourceChainId?: number,  // Source chain ID
+    priceRelayAddress?: `0x${string}`,  // For relay chains
+    existingRecordTxHash?: `0x${string}` // Optional: retry attestation without re-recording
   ) => Promise<void>;
   progress: UpdateProgress;
   isUpdating: boolean;
@@ -256,6 +264,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
   const { data: walletClient } = useWalletClient();
   const chainId = useChainId();
   const { switchChainAsync } = useSwitchChain();
+  const wagmiConfig = useConfig();
 
   const [progress, setProgress] = useState<UpdateProgress>({
     step: 'idle',
@@ -269,13 +278,33 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
   }, []);
 
   const updateFeed = useCallback(async (
-    priceRecorderAddress: `0x${string}`,
+    priceRecorderAddress: `0x${string}` | undefined,
     poolAddress: `0x${string}`,
     feedAddress: `0x${string}`,
-    sourceChainId: number = 14  // Default to Flare if not specified
+    sourceChainId: number = 14,  // Default to Flare if not specified
+    priceRelayAddress?: `0x${string}`,  // For relay chains
+    existingRecordTxHash?: `0x${string}` // Optional: skip recordPrice and just attest this tx
   ) => {
+    console.log('[FeedUpdater] ===== UPDATE FEED CALLED =====');
+    console.log('[FeedUpdater] priceRecorderAddress:', priceRecorderAddress);
+    console.log('[FeedUpdater] poolAddress:', poolAddress);
+    console.log('[FeedUpdater] feedAddress:', feedAddress);
+    console.log('[FeedUpdater] sourceChainId param:', sourceChainId);
+    
     if (!publicClient || !walletClient) {
       throw new Error('Wallet not connected');
+    }
+
+    // Determine if this is a relay chain
+    const isRelay = isRelayChain(sourceChainId);
+    const sourceChain = getSourceChainById(sourceChainId);
+    
+    // Validate inputs based on flow type
+    if (isRelay && !priceRelayAddress) {
+      throw new Error('PriceRelay address required for relay chains');
+    }
+    if (!isRelay && !priceRecorderAddress) {
+      throw new Error('PriceRecorder address required for direct chains');
     }
 
     // Get FDC config for Flare (where attestation happens)
@@ -284,13 +313,15 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
       throw new Error('FDC not available on this network');
     }
 
-    // Get source chain config
-    const sourceConfig = SOURCE_CONFIG[sourceChainId];
+    // For relay chains, attestation is always for Flare (where relay tx happens)
+    // For direct chains, attestation is for the source chain
+    const attestationSourceChainId = isRelay ? 14 : sourceChainId;
+    console.log('[FeedUpdater] sourceChainId:', sourceChainId, 'isRelay:', isRelay, 'attestationSourceChainId:', attestationSourceChainId);
+    const sourceConfig = SOURCE_CONFIG[attestationSourceChainId];
     if (!sourceConfig) {
-      throw new Error(`Unsupported source chain ID: ${sourceChainId}`);
+      throw new Error(`Unsupported attestation source chain ID: ${attestationSourceChainId}`);
     }
 
-    const sourceChain = getSourceChainById(sourceChainId);
     const isFlareSource = sourceChainId === 14 || sourceChainId === 114;
 
     setIsUpdating(true);
@@ -306,154 +337,374 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
       });
     };
 
+    // The tx hash we ultimately want to attest (so we can retry without re-recording)
+    let attestationTxHashForRetry: `0x${string}` | undefined;
+
     try {
-      // Step 1: If source chain is not Flare, switch to it
-      let currentChainId = chainId;
-      
-      if (!isFlareSource && currentChainId !== sourceChainId) {
-        updateProgress('switching-to-source', `Switching to ${sourceChain?.name || 'source chain'}...`);
+      let recordTxHash: `0x${string}`;
+      let lastVerifierRequestId: string | undefined;
+
+      if (isRelay) {
+        // ===== RELAY FLOW =====
+        // 1. Fetch price from source chain via API (no wallet needed on source)
+        updateProgress('fetching-price', `Fetching price from ${sourceChain?.name || 'source chain'}...`);
         
-        try {
-          await switchChainAsync({ chainId: sourceChainId });
-          currentChainId = sourceChainId;
-          // Small delay to let wallet client update
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        } catch (switchError) {
-          if ((switchError as Error).message?.includes('rejected')) {
-            throw new Error('Network switch rejected. Please switch manually and try again.');
-          }
-          throw switchError;
+        const priceResponse = await fetch('/api/relay/fetch-price', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chainId: sourceChainId,
+            poolAddress: poolAddress,
+          }),
+        });
+
+        if (!priceResponse.ok) {
+          const errorData = await priceResponse.json().catch(() => ({}));
+          throw new Error(errorData.error || 'Failed to fetch price from source chain');
         }
-      }
 
-      // Create a client for the source chain
-      const sourceChainDef = getChainDefinition(sourceChainId);
-      const sourceClient = createPublicClient({
-        chain: sourceChainDef,
-        transport: http(sourceChain?.rpcUrl),
-      });
+        const priceData = await priceResponse.json();
 
-      // Step 2: Check if pool is enabled on recorder
-      updateProgress('checking', 'Checking pool status...');
-      
-      const isEnabled = await sourceClient.readContract({
-        address: priceRecorderAddress,
-        abi: PRICE_RECORDER_ABI,
-        functionName: 'enabledPools',
-        args: [poolAddress],
-      });
+        if (cancelled) throw new Error('Cancelled by user');
 
-      // If pool is not enabled, enable it first
-      if (!isEnabled) {
-        updateProgress('enabling-pool', 'Pool not enabled on recorder. Please confirm transaction to enable...');
+        // 2. Ensure we're on Flare for relay transaction
+        if (chainId !== 14) {
+          updateProgress('switching-to-flare', 'Switching to Flare for relay...');
+          try {
+            await switchChainAsync({ chainId: 14 });
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          } catch (switchError) {
+            if ((switchError as Error).message?.includes('rejected')) {
+              throw new Error('Network switch to Flare rejected.');
+            }
+            throw switchError;
+          }
+        }
+
+        // 3. Call PriceRelay contract on Flare
+        updateProgress('relaying-price', `Relaying price to Flare (from ${sourceChain?.name})...`);
+
+        const relayHash = await walletClient.writeContract({
+          address: priceRelayAddress!,
+          abi: PRICE_RELAY_ABI,
+          functionName: 'relayPrice',
+          args: [
+            BigInt(priceData.chainId),
+            priceData.poolAddress as `0x${string}`,
+            BigInt(priceData.sqrtPriceX96),
+            priceData.tick,
+            BigInt(priceData.liquidity),
+            priceData.token0 as `0x${string}`,
+            priceData.token1 as `0x${string}`,
+            BigInt(priceData.sourceTimestamp),
+            BigInt(priceData.sourceBlockNumber),
+          ],
+        });
+
+        updateProgress('relaying-price', 'Waiting for relay confirmation...', { txHash: relayHash });
+
+        // Create Flare client
+        const flareClient = createPublicClient({
+          chain: flare,
+          transport: http(),
+        });
+
+        const relayReceipt = await flareClient.waitForTransactionReceipt({ hash: relayHash });
         
-        const enableHash = await walletClient.writeContract({
-          address: priceRecorderAddress,
+        if (relayReceipt.status === 'reverted') {
+          throw new Error('Relay transaction reverted. Pool may not be enabled or tokens may not match.');
+        }
+
+        recordTxHash = relayHash;
+        attestationTxHashForRetry = recordTxHash;
+
+      } else {
+        // ===== DIRECT FLOW =====
+        if (existingRecordTxHash) {
+          // Skip recording a new price; only attest an existing tx hash.
+          recordTxHash = existingRecordTxHash;
+          attestationTxHashForRetry = recordTxHash;
+          
+          // Ensure we're on Flare for the attestation workflow
+          if (chainId !== 14) {
+            updateProgress('switching-to-flare', 'Switching to Flare for attestation...');
+            try {
+              await switchChainAsync({ chainId: 14 });
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            } catch (switchError) {
+              if ((switchError as Error).message?.includes('rejected')) {
+                throw new Error('Network switch to Flare rejected. Please switch manually and try again.');
+              }
+              throw switchError;
+            }
+          }
+        } else {
+        // Step 1: If source chain is not Flare, switch to it
+        let currentChainId = chainId;
+        
+        if (!isFlareSource && currentChainId !== sourceChainId) {
+          updateProgress('switching-to-source', `Switching to ${sourceChain?.name || 'source chain'}...`);
+          
+          try {
+            await switchChainAsync({ chainId: sourceChainId });
+            currentChainId = sourceChainId;
+            // Small delay to let wallet client update
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          } catch (switchError) {
+            if ((switchError as Error).message?.includes('rejected')) {
+              throw new Error('Network switch rejected. Please switch manually and try again.');
+            }
+            throw switchError;
+          }
+        }
+
+        // Get a FRESH wallet client for the source chain after switching
+        const sourceWalletClient = await getWalletClient(wagmiConfig, { chainId: sourceChainId });
+        if (!sourceWalletClient) {
+          throw new Error(`Failed to get wallet client for ${sourceChain?.name || 'source chain'}. Please ensure your wallet is connected.`);
+        }
+
+        // Create a client for the source chain
+        const sourceChainDef = getChainDefinition(sourceChainId);
+        const sourceClient = createPublicClient({
+          chain: sourceChainDef,
+          transport: http(sourceChain?.rpcUrl),
+        });
+
+        // Step 2: Check if pool is enabled on recorder
+        updateProgress('checking', 'Checking pool status...');
+        
+        const isEnabled = await sourceClient.readContract({
+          address: priceRecorderAddress!,
           abi: PRICE_RECORDER_ABI,
-          functionName: 'enablePool',
+          functionName: 'enabledPools',
           args: [poolAddress],
         });
 
-        updateProgress('enabling-pool', 'Waiting for pool enable confirmation...');
-        const enableReceipt = await sourceClient.waitForTransactionReceipt({ hash: enableHash });
-        
-        if (enableReceipt.status === 'reverted') {
-          throw new Error('Failed to enable pool on recorder');
-        }
+        // If pool is not enabled, enable it first
+        if (!isEnabled) {
+          updateProgress('enabling-pool', 'Pool not enabled on recorder. Please confirm transaction to enable...');
+          
+          const enableHash = await sourceWalletClient.writeContract({
+            address: priceRecorderAddress!,
+            abi: PRICE_RECORDER_ABI,
+            functionName: 'enablePool',
+            args: [poolAddress],
+          });
 
-        updateProgress('enabling-pool', 'Pool enabled successfully! Continuing...');
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-
-      // Check if can update (interval check)
-      const canUpdate = await sourceClient.readContract({
-        address: priceRecorderAddress,
-        abi: PRICE_RECORDER_ABI,
-        functionName: 'canUpdate',
-        args: [poolAddress],
-      });
-
-      if (!canUpdate) {
-        throw new Error('Pool cannot be updated yet (interval not elapsed). Please wait a few minutes.');
-      }
-
-      if (cancelled) throw new Error('Cancelled by user');
-
-      // Step 3: Record price on source chain
-      const gasWarning = !isFlareSource 
-        ? ` (requires ${sourceChain?.nativeCurrency.symbol || 'gas'} for gas)` 
-        : '';
-      updateProgress('recording', `Recording price on ${sourceChain?.name || 'source chain'}${gasWarning}...`);
-
-      const recordHash = await walletClient.writeContract({
-        address: priceRecorderAddress,
-        abi: PRICE_RECORDER_ABI,
-        functionName: 'recordPrice',
-        args: [poolAddress],
-      });
-
-      updateProgress('recording', 'Waiting for confirmation...', { txHash: recordHash });
-
-      const recordReceipt = await sourceClient.waitForTransactionReceipt({ hash: recordHash });
-      
-      if (recordReceipt.status === 'reverted') {
-        throw new Error('Record transaction reverted');
-      }
-
-      if (cancelled) throw new Error('Cancelled by user');
-
-      // Step 4: Switch back to Flare for attestation (if on different chain)
-      if (!isFlareSource && currentChainId !== 14) {
-        updateProgress('switching-to-flare', 'Switching back to Flare for attestation...');
-        
-        try {
-          await switchChainAsync({ chainId: 14 });
-          currentChainId = 14;
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        } catch (switchError) {
-          if ((switchError as Error).message?.includes('rejected')) {
-            throw new Error('Network switch to Flare rejected. Please switch manually and try again.');
+          updateProgress('enabling-pool', 'Waiting for pool enable confirmation...');
+          const enableReceipt = await sourceClient.waitForTransactionReceipt({ 
+            hash: enableHash,
+            timeout: 120_000,
+            pollingInterval: 2_000,
+          });
+          
+          if (enableReceipt.status === 'reverted') {
+            throw new Error('Failed to enable pool on recorder');
           }
-          throw switchError;
+
+          updateProgress('enabling-pool', 'Pool enabled successfully! Continuing...');
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+
+        // Check if can update (interval check)
+        const canUpdate = await sourceClient.readContract({
+          address: priceRecorderAddress!,
+          abi: PRICE_RECORDER_ABI,
+          functionName: 'canUpdate',
+          args: [poolAddress],
+        });
+
+        if (!canUpdate) {
+          throw new Error('Pool cannot be updated yet (interval not elapsed). Please wait a few minutes.');
+        }
+
+        if (cancelled) throw new Error('Cancelled by user');
+
+        // Step 3: Record price on source chain
+        const gasWarning = !isFlareSource 
+          ? ` (requires ${sourceChain?.nativeCurrency.symbol || 'gas'} for gas)` 
+          : '';
+        updateProgress('recording', `Recording price on ${sourceChain?.name || 'source chain'}${gasWarning}...`);
+
+        const recordHash = await sourceWalletClient.writeContract({
+          address: priceRecorderAddress!,
+          abi: PRICE_RECORDER_ABI,
+          functionName: 'recordPrice',
+          args: [poolAddress],
+        });
+
+        updateProgress('recording', 'Waiting for confirmation...', { txHash: recordHash });
+
+        const recordReceipt = await sourceClient.waitForTransactionReceipt({ 
+          hash: recordHash,
+          timeout: 120_000,
+          pollingInterval: 2_000,
+        });
+        
+        if (recordReceipt.status === 'reverted') {
+          throw new Error('Record transaction reverted');
+        }
+
+        if (cancelled) throw new Error('Cancelled by user');
+
+        // Step 4: Switch back to Flare for attestation (if on different chain)
+        if (!isFlareSource && currentChainId !== 14) {
+          updateProgress('switching-to-flare', 'Switching back to Flare for attestation...');
+          
+          try {
+            await switchChainAsync({ chainId: 14 });
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          } catch (switchError) {
+            if ((switchError as Error).message?.includes('rejected')) {
+              throw new Error('Network switch to Flare rejected. Please switch manually and try again.');
+            }
+            throw switchError;
+          }
+        }
+
+        recordTxHash = recordHash;
+        attestationTxHashForRetry = recordTxHash;
         }
       }
 
+      // ===== COMMON ATTESTATION FLOW (both direct and relay) =====
+      
       // Create Flare client for attestation
       const flareClient = createPublicClient({
         chain: flare,
         transport: http(),
       });
 
-      // Step 5: Request FDC attestation
-      updateProgress('requesting-attestation', 'Preparing attestation request...');
-
-      // Call verifier API via our proxy to avoid CORS
-      const verifierResponse = await fetch('/api/fdc/prepare-request', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          flareChainId: 14,
-          sourceChainId: sourceChainId,
-          attestationType: '0x45564d5472616e73616374696f6e000000000000000000000000000000000000',
-          sourceId: sourceConfig.sourceId,
-          requestBody: {
-            transactionHash: recordHash,
-            requiredConfirmations: '1',
-            provideInput: false,
-            listEvents: true,
-            logIndices: [],
-          },
-        }),
-      });
-
-      if (!verifierResponse.ok) {
-        const errorData = await verifierResponse.json().catch(() => ({}));
-        throw new Error(errorData.error || 'Failed to prepare attestation request');
+      // Get a FRESH wallet client for Flare (after potential chain switches)
+      const flareWalletClient = await getWalletClient(wagmiConfig, { chainId: 14 });
+      if (!flareWalletClient) {
+        throw new Error('Failed to get Flare wallet client. Please ensure your wallet is connected to Flare.');
       }
 
-      const verifierData = await verifierResponse.json();
+      // Request FDC attestation
+      // Ethereum needs 12+ confirmations, Flare needs only 1
+      const requiredConfirmations = attestationSourceChainId === 1 ? '12' : '1';
+      
+      // For ETH, actively poll for confirmations instead of fixed wait
+      if (attestationSourceChainId === 1) {
+        updateProgress('requesting-attestation', 'Waiting for Ethereum confirmations...');
+        console.log('[FeedUpdater] Polling for ETH confirmations on tx:', recordTxHash);
+        
+        // Create ETH client to check confirmations
+        const ethClient = createPublicClient({
+          chain: ethereum,
+          transport: http('https://ethereum-rpc.publicnode.com'),
+        });
+        
+        const REQUIRED_CONFIRMATIONS = 12;
+        const MAX_WAIT_TIME = 300000; // 5 minutes max
+        const POLL_INTERVAL = 12000; // Check every 12 seconds (1 ETH block)
+        const startTime = Date.now();
+        
+        while (Date.now() - startTime < MAX_WAIT_TIME) {
+          if (cancelled) throw new Error('Cancelled by user');
+          
+          try {
+            const receipt = await ethClient.getTransactionReceipt({ hash: recordTxHash });
+            const currentBlock = await ethClient.getBlockNumber();
+            const confirmations = Number(currentBlock) - Number(receipt.blockNumber);
+            
+            console.log('[FeedUpdater] Confirmations:', confirmations, '/', REQUIRED_CONFIRMATIONS);
+            updateProgress('requesting-attestation', `Waiting for confirmations: ${confirmations}/${REQUIRED_CONFIRMATIONS}...`);
+            
+            if (confirmations >= REQUIRED_CONFIRMATIONS) {
+              console.log('[FeedUpdater] ✅ Got', confirmations, 'confirmations, proceeding...');
+              break;
+            }
+          } catch (e) {
+            console.log('[FeedUpdater] Error checking confirmations:', e);
+          }
+          
+          await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
+        }
+        
+        // Extra buffer for FDC indexer to catch up (can be minutes on ETH mainnet)
+        console.log('[FeedUpdater] Adding 120s buffer for FDC indexer...');
+        updateProgress('requesting-attestation', 'Waiting for FDC indexer (can take a few minutes on Ethereum)...');
+        await new Promise(resolve => setTimeout(resolve, 120000));
+      }
+      
+      updateProgress('requesting-attestation', 'Preparing attestation request...');
+
+      // Call verifier API via our proxy - aggressive retry for ETH due to flaky verifier
+      console.log('[FeedUpdater] Requesting attestation for tx:', recordTxHash, 'with', requiredConfirmations, 'confirmations');
+      let verifierData: { abiEncodedRequest?: string; status?: string } | null = null;
+      
+      // ETH verifier/indexer can lag significantly; retry for a time window, not a fixed small count
+      const retryDelay = attestationSourceChainId === 1 ? 30000 : 0; // 30s for ETH, 0 for others
+      const maxVerifierWaitMs = attestationSourceChainId === 1 ? 15 * 60_000 : 0; // up to 15 minutes on ETH
+      const verifierStart = Date.now();
+      let attempt = 0;
+      
+      while (true) {
+        attempt += 1;
+        if (cancelled) throw new Error('Cancelled by user');
+        
+        const verifierResponse = await fetch('/api/fdc/prepare-request', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          cache: 'no-store',
+          body: JSON.stringify({
+            flareChainId: 14,
+            sourceChainId: attestationSourceChainId,
+            attestationType: '0x45564d5472616e73616374696f6e000000000000000000000000000000000000',
+            sourceId: sourceConfig.sourceId,
+            requestBody: {
+              transactionHash: recordTxHash,
+              requiredConfirmations,
+              provideInput: false,
+              listEvents: true,
+              logIndices: [],
+            },
+          }),
+        });
+
+        if (!verifierResponse.ok) {
+          const errorData = await verifierResponse.json().catch(() => ({}));
+          throw new Error(errorData.error || 'Failed to prepare attestation request');
+        }
+
+        verifierData = await verifierResponse.json();
+        lastVerifierRequestId = (verifierData as any)?.requestId;
+        
+        if (verifierData?.abiEncodedRequest) {
+          console.log('[FeedUpdater] ✅ Got valid response on attempt', attempt);
+          break; // Success
+        }
+        
+        if (attestationSourceChainId !== 1) break; // no retries for non-ETH (current behavior)
+        
+        const waitedMs = Date.now() - verifierStart;
+        const waitedMin = Math.floor(waitedMs / 60000);
+        console.log('[FeedUpdater] Attempt', attempt, 'returned', verifierData?.status, '(requestId:', lastVerifierRequestId, ') waited:', waitedMin, 'min');
+        
+        if (waitedMs >= maxVerifierWaitMs) break;
+        
+        updateProgress(
+          'requesting-attestation',
+          `Verifier still indexing ETH tx (attempt ${attempt}, waited ${waitedMin}m). Retrying in ${retryDelay / 1000}s...`
+        );
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+      }
+      
+      if (!verifierData?.abiEncodedRequest) {
+        const waitedMs = Date.now() - verifierStart;
+        const waitedMin = Math.floor(waitedMs / 60000);
+        throw new Error(
+          `FDC verifier returned status: ${verifierData?.status || 'unknown'} after ${attempt} attempts (~${waitedMin}m). ` +
+          `This usually means the verifier/indexer hasn't ingested the ETH transaction yet. Try "Retry attestation" in a few minutes (no need to record again).` +
+          (lastVerifierRequestId ? ` (requestId: ${lastVerifierRequestId})` : '')
+        );
+      }
+      
       const requestBytes = verifierData.abiEncodedRequest as `0x${string}`;
 
       if (cancelled) throw new Error('Cancelled by user');
@@ -483,7 +734,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
       // Submit attestation request
       updateProgress('requesting-attestation', `Submitting attestation request (fee: ${(Number(fee) / 1e18).toFixed(2)} FLR)...`);
 
-      const attestHash = await walletClient.writeContract({
+      const attestHash = await flareWalletClient.writeContract({
         address: fdcConfig.FDC_HUB,
         abi: FDC_HUB_ABI,
         functionName: 'requestAttestation',
@@ -509,7 +760,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
 
       if (cancelled) throw new Error('Cancelled by user');
 
-      // Step 6: Wait for finalization
+      // Wait for finalization
       updateProgress('waiting-finalization', `Waiting for FDC finalization (Round ${votingRoundId})...`);
 
       const maxWaitMs = 300000; // 5 minutes
@@ -542,7 +793,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
 
       if (cancelled) throw new Error('Cancelled by user');
 
-      // Step 7: Retrieve proof from DA Layer via our proxy
+      // Retrieve proof from DA Layer via our proxy
       updateProgress('retrieving-proof', 'Retrieving proof from DA Layer...');
 
       const proofResponse = await fetch('/api/fdc/get-proof', {
@@ -568,7 +819,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
 
       if (cancelled) throw new Error('Cancelled by user');
 
-      // Step 8: Parse and submit proof to feed
+      // Parse and submit proof to feed
       updateProgress('submitting-proof', 'Submitting proof to feed contract...');
 
       // Decode the response
@@ -579,7 +830,10 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
         proofData.response_hex as `0x${string}`
       );
 
-      // Format proof for contract
+      // Format proof for contract with null safety
+      const logIndices = decodedResponse.requestBody?.logIndices || [];
+      const events = decodedResponse.responseBody?.events || [];
+      
       const proofStruct = {
         merkleProof: (proofData.proof || []) as `0x${string}`[],
         data: {
@@ -592,7 +846,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
             requiredConfirmations: decodedResponse.requestBody.requiredConfirmations,
             provideInput: decodedResponse.requestBody.provideInput,
             listEvents: decodedResponse.requestBody.listEvents,
-            logIndices: [...decodedResponse.requestBody.logIndices],
+            logIndices: [...logIndices],
           },
           responseBody: {
             blockNumber: decodedResponse.responseBody.blockNumber,
@@ -603,7 +857,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
             value: decodedResponse.responseBody.value,
             input: decodedResponse.responseBody.input,
             status: decodedResponse.responseBody.status,
-            events: decodedResponse.responseBody.events.map((event: {
+            events: events.map((event: {
               logIndex: number | bigint;
               emitterAddress: string;
               topics: readonly `0x${string}`[];
@@ -612,7 +866,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
             }) => ({
               logIndex: Number(event.logIndex),
               emitterAddress: event.emitterAddress,
-              topics: event.topics,
+              topics: [...(event.topics || [])],
               data: event.data,
               removed: event.removed,
             })),
@@ -620,7 +874,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
         },
       };
 
-      const updateHash = await walletClient.writeContract({
+      const updateHash = await flareWalletClient.writeContract({
         address: feedAddress,
         abi: CUSTOM_FEED_ABI,
         functionName: 'updateFromProof',
@@ -643,6 +897,8 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
         message: errorMessage,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: errorMessage,
+        // Preserve the tx hash we were trying to attest so the UI can offer "retry attestation only"
+        txHash: attestationTxHashForRetry,
       });
     } finally {
       setIsUpdating(false);

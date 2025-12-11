@@ -1,6 +1,6 @@
 'use client';
 
-import { Check, AlertTriangle, Info, Coins } from 'lucide-react';
+import { Check, AlertTriangle, Info, Coins, Shield } from 'lucide-react';
 import {
   Select,
   SelectContent,
@@ -14,7 +14,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { 
   SUPPORTED_CHAINS, 
   getDirectChains, 
-  getSelectableChains,
+  getRelayChains,
   type SupportedChain 
 } from '@/lib/chains';
 
@@ -24,6 +24,7 @@ interface ChainSelectorProps {
   disabled?: boolean;
   includeTestnets?: boolean;
   showGasWarning?: boolean;  // Show warning about needing gas on source chain
+  showRelayChains?: boolean; // Show relay chains as selectable
 }
 
 export function ChainSelector({ 
@@ -32,12 +33,11 @@ export function ChainSelector({
   disabled, 
   includeTestnets = true,
   showGasWarning = true,
+  showRelayChains = true,
 }: ChainSelectorProps) {
   const selectedChain = value ? SUPPORTED_CHAINS.find(c => c.id === value) : undefined;
   const directChains = getDirectChains(includeTestnets);
-  
-  // Phase 1: Only show direct chains
-  const selectableChains = getSelectableChains(includeTestnets);
+  const relayChains = getRelayChains();
   
   return (
     <div className="space-y-3">
@@ -55,6 +55,11 @@ export function ChainSelector({
                 {selectedChain.testnet && (
                   <span className="text-xs bg-secondary px-1.5 py-0.5 rounded">
                     Testnet
+                  </span>
+                )}
+                {selectedChain.category === 'relay' && (
+                  <span className="text-xs bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200 px-1.5 py-0.5 rounded">
+                    Relay
                   </span>
                 )}
               </span>
@@ -84,27 +89,48 @@ export function ChainSelector({
             ))}
           </SelectGroup>
           
-          {/* Phase 1: Show relay chains as "Coming Soon" */}
-          <SelectGroup>
-            <SelectLabel className="flex items-center gap-2 mt-2 text-muted-foreground">
-              <AlertTriangle className="h-4 w-4 text-yellow-500" />
-              Relay Chains (Coming Soon)
-            </SelectLabel>
-            {/* Disabled relay chain options */}
-            <div className="px-2 py-1.5 text-sm text-muted-foreground">
-              Arbitrum, Base, Optimism, Polygon
-            </div>
-          </SelectGroup>
+          {/* Relay Chains - Now selectable in Phase 3 */}
+          {showRelayChains && (
+            <SelectGroup>
+              <SelectLabel className="flex items-center gap-2 mt-2">
+                <AlertTriangle className="h-4 w-4 text-yellow-500" />
+                Relay (Bot-Assisted)
+              </SelectLabel>
+              {relayChains.map(chain => (
+                <SelectItem key={chain.id} value={chain.id.toString()}>
+                  <div className="flex items-center gap-2">
+                    <ChainIcon chainId={chain.id} />
+                    <span>{chain.name}</span>
+                    <span className="text-xs bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200 px-1 rounded">
+                      Relay
+                    </span>
+                  </div>
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          )}
         </SelectContent>
       </Select>
       
-      {/* Gas requirement warning for non-Flare chains */}
+      {/* Gas requirement warning for direct non-Flare chains */}
       {showGasWarning && selectedChain && selectedChain.id !== 14 && selectedChain.category === 'direct' && (
         <Alert className="bg-blue-50 border-blue-200 dark:bg-blue-950 dark:border-blue-900">
           <Coins className="h-4 w-4 text-blue-600" />
           <AlertDescription className="text-sm">
             <strong>Gas Required:</strong> You need {selectedChain.nativeCurrency.symbol} on{' '}
             {selectedChain.name} to record prices. The feed contract stays on Flare.
+          </AlertDescription>
+        </Alert>
+      )}
+      
+      {/* Trust model warning for relay chains */}
+      {selectedChain?.category === 'relay' && (
+        <Alert className="bg-yellow-50 border-yellow-200 dark:bg-yellow-950 dark:border-yellow-900">
+          <Shield className="h-4 w-4 text-yellow-600" />
+          <AlertDescription className="text-sm">
+            <strong>Relay Trust Model:</strong> {selectedChain.name} uses a relay bot to fetch prices. 
+            The bot is trusted to report accurate data. No gas required on {selectedChain.name} — 
+            only FLR for the relay transaction.
           </AlertDescription>
         </Alert>
       )}

@@ -16,14 +16,16 @@ import {
   Settings,
   Terminal,
   FileCode,
-  AlertCircle
+  AlertCircle,
+  Bot,
+  ExternalLink
 } from 'lucide-react';
+import Link from 'next/link';
 import type { NetworkId, StoredFeed, StoredRecorder } from '@/lib/types';
 
 function generateBotEnvConfig(
   feeds: StoredFeed[],
-  recorder: StoredRecorder | null,
-  network: NetworkId,
+  recorders: StoredRecorder[],
   privateKeyPlaceholder: boolean = true
 ): string {
   const lines: string[] = [
@@ -43,22 +45,52 @@ function generateBotEnvConfig(
     '',
   ];
   
-  if (recorder) {
-    lines.push('# Price Recorder Contract');
-    lines.push(`PRICE_RECORDER_ADDRESS=${recorder.address}`);
+  // Group recorders by chain
+  const flareRecorders = recorders.filter(r => (r.chainId ?? 14) === 14);
+  if (flareRecorders.length > 0) {
+    lines.push('# Price Recorder Contract (Flare)');
+    lines.push(`PRICE_RECORDER_ADDRESS=${flareRecorders[0].address}`);
     lines.push('');
   }
   
   if (feeds.length > 0) {
-    lines.push('# Custom Feeds');
-    lines.push('# Format: POOL_ADDRESS_<ALIAS> and CUSTOM_FEED_ADDRESS_<ALIAS>');
-    lines.push('');
+    // Separate feeds by type
+    const directFeeds = feeds.filter(f => f.sourceChain?.category !== 'relay');
+    const relayFeeds = feeds.filter(f => f.sourceChain?.category === 'relay');
     
-    for (const feed of feeds) {
-      lines.push(`# ${feed.alias}`);
-      lines.push(`POOL_ADDRESS_${feed.alias}=${feed.poolAddress}`);
-      lines.push(`CUSTOM_FEED_ADDRESS_${feed.alias}=${feed.customFeedAddress}`);
+    if (directFeeds.length > 0) {
+      lines.push('# Direct Feeds (Flare, Ethereum)');
+      lines.push('# Format: POOL_ADDRESS_<ALIAS> and CUSTOM_FEED_ADDRESS_<ALIAS>');
       lines.push('');
+      
+      for (const feed of directFeeds) {
+        const sourceChainName = feed.sourceChain?.name || 'Flare';
+        lines.push(`# ${feed.alias} [${sourceChainName}]`);
+        lines.push(`POOL_ADDRESS_${feed.alias}=${feed.sourcePoolAddress || feed.poolAddress}`);
+        lines.push(`CUSTOM_FEED_ADDRESS_${feed.alias}=${feed.customFeedAddress}`);
+        if (feed.sourceChain && feed.sourceChain.id !== 14) {
+          lines.push(`SOURCE_CHAIN_ID_${feed.alias}=${feed.sourceChain.id}`);
+        }
+        lines.push('');
+      }
+    }
+    
+    if (relayFeeds.length > 0) {
+      lines.push('# Relay Feeds (Arbitrum, Base, Optimism, Polygon)');
+      lines.push('# These use PriceRelay contract instead of PriceRecorder');
+      lines.push('');
+      
+      for (const feed of relayFeeds) {
+        const sourceChainName = feed.sourceChain?.name || 'Unknown';
+        lines.push(`# ${feed.alias} [${sourceChainName}] - RELAY`);
+        lines.push(`POOL_ADDRESS_${feed.alias}=${feed.sourcePoolAddress || feed.poolAddress}`);
+        lines.push(`CUSTOM_FEED_ADDRESS_${feed.alias}=${feed.customFeedAddress}`);
+        lines.push(`SOURCE_CHAIN_ID_${feed.alias}=${feed.sourceChain?.id}`);
+        if (feed.priceRelayAddress) {
+          lines.push(`PRICE_RELAY_ADDRESS_${feed.alias}=${feed.priceRelayAddress}`);
+        }
+        lines.push('');
+      }
     }
   }
   
@@ -66,6 +98,9 @@ function generateBotEnvConfig(
   lines.push('BOT_CHECK_INTERVAL_SECONDS=60');
   lines.push('BOT_LOG_LEVEL=compact');
   lines.push('BOT_LOG_FILE_ENABLED=true');
+  lines.push('');
+  lines.push('# Frontend Bot (for hosted deployments)');
+  lines.push('# NEXT_PUBLIC_APP_URL=http://localhost:3000');
   
   return lines.join('\n');
 }
@@ -86,9 +121,8 @@ export default function SettingsPage() {
   const { feeds, recorders } = useFeeds();
   const chainId = useChainId();
 
-  const networkId: NetworkId = 'flare';
-  const networkFeeds = feeds.filter(f => f.network === networkId);
-  const networkRecorders = recorders.filter(r => r.network === networkId);
+  // All feeds (no network filter since feeds are always on Flare)
+  const allFeeds = feeds;
 
   const [selectedFeeds, setSelectedFeeds] = useState<Set<string>>(new Set());
 
@@ -105,7 +139,7 @@ export default function SettingsPage() {
   };
 
   const selectAllFeeds = () => {
-    setSelectedFeeds(new Set(networkFeeds.map(f => f.id)));
+    setSelectedFeeds(new Set(allFeeds.map(f => f.id)));
   };
 
   const clearSelection = () => {
@@ -113,14 +147,13 @@ export default function SettingsPage() {
   };
 
   const selectedFeedsArray = useMemo(() => 
-    networkFeeds.filter(f => selectedFeeds.has(f.id)),
-    [networkFeeds, selectedFeeds]
+    allFeeds.filter(f => selectedFeeds.has(f.id)),
+    [allFeeds, selectedFeeds]
   );
 
   const generatedConfig = useMemo(() => {
-    const recorder = networkRecorders[0] || null;
-    return generateBotEnvConfig(selectedFeedsArray, recorder, networkId);
-  }, [selectedFeedsArray, networkRecorders, networkId]);
+    return generateBotEnvConfig(selectedFeedsArray, recorders);
+  }, [selectedFeedsArray, recorders]);
 
   const copyToClipboard = () => {
     navigator.clipboard.writeText(generatedConfig);
@@ -144,7 +177,11 @@ export default function SettingsPage() {
           <TabsList>
             <TabsTrigger value="bot-config">
               <Terminal className="w-4 h-4 mr-2" />
-              Bot Configuration
+              Export Config
+            </TabsTrigger>
+            <TabsTrigger value="frontend-bot">
+              <Bot className="w-4 h-4 mr-2" />
+              Frontend Bot
             </TabsTrigger>
             <TabsTrigger value="about">
               <Settings className="w-4 h-4 mr-2" />
@@ -166,7 +203,7 @@ export default function SettingsPage() {
               </CardHeader>
               <CardContent className="space-y-6">
                 {/* Feed Selection */}
-                {networkFeeds.length > 0 ? (
+                {allFeeds.length > 0 ? (
                   <div className="space-y-4">
                     <div className="flex items-center justify-between">
                       <Label>Select feeds to include</Label>
@@ -181,7 +218,7 @@ export default function SettingsPage() {
                     </div>
                     
                     <div className="grid gap-2">
-                      {networkFeeds.map((feed) => (
+                      {allFeeds.map((feed) => (
                         <div
                           key={feed.id}
                           className="flex items-center space-x-3 p-3 rounded-lg bg-secondary/50 hover:bg-secondary transition-colors"
@@ -199,6 +236,16 @@ export default function SettingsPage() {
                             <span className="text-muted-foreground ml-2">
                               ({feed.token0.symbol}/{feed.token1.symbol})
                             </span>
+                            {feed.sourceChain?.category === 'relay' && (
+                              <span className="ml-2 text-xs bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200 px-1.5 py-0.5 rounded">
+                                Relay
+                              </span>
+                            )}
+                            {feed.sourceChain && feed.sourceChain.id !== 14 && feed.sourceChain.category !== 'relay' && (
+                              <span className="ml-2 text-xs text-muted-foreground">
+                                ({feed.sourceChain.name})
+                              </span>
+                            )}
                           </Label>
                         </div>
                       ))}
@@ -207,7 +254,7 @@ export default function SettingsPage() {
                 ) : (
                   <div className="text-center py-6 text-muted-foreground">
                     <AlertCircle className="w-8 h-8 mx-auto mb-2 opacity-50" />
-                    <p>No feeds deployed on Mainnet yet.</p>
+                    <p>No feeds deployed yet.</p>
                   </div>
                 )}
 
@@ -269,6 +316,66 @@ export default function SettingsPage() {
                     Monitor the console output for status updates.
                   </p>
                 </div>
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          <TabsContent value="frontend-bot" className="space-y-6">
+            <Card>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                  <Bot className="w-5 h-5 text-brand-500" />
+                  Frontend Bot Control
+                </CardTitle>
+                <CardDescription>
+                  Run and monitor the bot directly from the web interface
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <p className="text-sm text-muted-foreground">
+                  For hosted deployments, you can control the bot from the frontend instead of running 
+                  it in the terminal. This is useful when deploying to platforms like Vercel, Railway, 
+                  or any cloud provider.
+                </p>
+
+                <div className="p-4 rounded-lg bg-brand-500/10 border border-brand-500/20">
+                  <h4 className="font-semibold text-brand-500 mb-2">Features</h4>
+                  <ul className="text-sm text-muted-foreground space-y-1">
+                    <li>• Start/stop bot from the dashboard</li>
+                    <li>• Real-time log streaming</li>
+                    <li>• Per-feed statistics</li>
+                    <li>• Supports both direct and relay chains</li>
+                  </ul>
+                </div>
+
+                <Link href="/dashboard/bot">
+                  <Button className="w-full bg-brand-500 hover:bg-brand-600">
+                    <Bot className="w-4 h-4 mr-2" />
+                    Open Bot Dashboard
+                    <ExternalLink className="w-4 h-4 ml-2" />
+                  </Button>
+                </Link>
+              </CardContent>
+            </Card>
+
+            <Card>
+              <CardHeader>
+                <CardTitle>Environment Setup</CardTitle>
+                <CardDescription>
+                  Required for frontend bot operation
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <p className="text-sm text-muted-foreground">
+                  Add these environment variables to your deployment:
+                </p>
+                <pre className="p-4 rounded-lg bg-black text-green-400 text-sm font-mono overflow-x-auto">
+{`# Required for bot operation
+DEPLOYER_PRIVATE_KEY=0x_YOUR_PRIVATE_KEY
+
+# Optional: For hosted deployments
+NEXT_PUBLIC_APP_URL=https://your-domain.com`}
+                </pre>
               </CardContent>
             </Card>
           </TabsContent>

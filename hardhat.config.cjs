@@ -27,6 +27,19 @@ module.exports = {
       accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : [],
       gasPrice: 25000000000, // 25 gwei
     },
+    // Ethereum Mainnet
+    ethereum: {
+      url: process.env.ETH_RPC_URL || "https://eth.llamarpc.com",
+      chainId: 1,
+      accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : [],
+      // Gas price will be auto-detected
+    },
+    // Sepolia Testnet
+    sepolia: {
+      url: process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia-rpc.publicnode.com",
+      chainId: 11155111,
+      accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : [],
+    },
     // Local Hardhat network
     hardhat: {
       chainId: 31337,

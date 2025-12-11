@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join } from 'path';
-import type { FeedsData, StoredFeed, StoredRecorder } from '@/lib/types';
+import type { FeedsData, StoredFeed, StoredRecorder, StoredRelay } from '@/lib/types';
 import { createClient } from '@supabase/supabase-js';
 
 // Check storage mode
@@ -19,7 +19,7 @@ const supabase = USE_DATABASE && process.env.NEXT_PUBLIC_SUPABASE_URL && process
 const DATA_PATH = join(process.cwd(), 'data', 'feeds.json');
 
 function getDefaultData(): FeedsData {
-  return { version: '1.0.0', feeds: [], recorders: [] };
+  return { version: '2.0.0', feeds: [], recorders: [], relays: [] };
 }
 
 function readLocalData(): FeedsData {
@@ -180,7 +180,7 @@ export async function GET() {
   }
 }
 
-// POST - Add new feed or recorder
+// POST - Add new feed, recorder, or relay
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
@@ -193,6 +193,9 @@ export async function POST(req: NextRequest) {
         if (!result.success) {
           return NextResponse.json({ error: result.error }, { status: 400 });
         }
+      } else if (type === 'relay') {
+        // TODO: Add Supabase relay support when needed
+        return NextResponse.json({ error: 'Relay storage not supported in database mode yet' }, { status: 400 });
       } else {
         const result = await addSupabaseFeed(item as StoredFeed);
         if (!result.success) {
@@ -208,8 +211,7 @@ export async function POST(req: NextRequest) {
       if (type === 'recorder') {
         const recorder = item as StoredRecorder;
         const exists = data.recorders.some(r => 
-          r.address.toLowerCase() === recorder.address.toLowerCase() && 
-          r.network === recorder.network
+          r.address.toLowerCase() === recorder.address.toLowerCase()
         );
         if (exists) {
           return NextResponse.json(
@@ -218,11 +220,26 @@ export async function POST(req: NextRequest) {
           );
         }
         data.recorders.push(recorder);
+      } else if (type === 'relay') {
+        const relay = item as StoredRelay;
+        // Initialize relays array if it doesn't exist
+        if (!data.relays) {
+          data.relays = [];
+        }
+        const exists = data.relays.some(r => 
+          r.address.toLowerCase() === relay.address.toLowerCase()
+        );
+        if (exists) {
+          return NextResponse.json(
+            { error: 'Relay already exists' },
+            { status: 400 }
+          );
+        }
+        data.relays.push(relay);
       } else {
         const feed = item as StoredFeed;
         const exists = data.feeds.some(f => 
-          f.customFeedAddress.toLowerCase() === feed.customFeedAddress.toLowerCase() && 
-          f.network === feed.network
+          f.customFeedAddress.toLowerCase() === feed.customFeedAddress.toLowerCase()
         );
         if (exists) {
           return NextResponse.json(
@@ -231,6 +248,11 @@ export async function POST(req: NextRequest) {
           );
         }
         data.feeds.push(feed);
+      }
+
+      // Update version to 2.0.0 if adding relay
+      if (type === 'relay' && data.version === '1.0.0') {
+        data.version = '2.0.0';
       }
 
       writeLocalData(data);
@@ -245,12 +267,12 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// DELETE - Remove feed or recorder by ID
+// DELETE - Remove feed, recorder, or relay by ID
 export async function DELETE(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
     const id = searchParams.get('id');
-    const type = (searchParams.get('type') || 'feed') as 'feed' | 'recorder';
+    const type = (searchParams.get('type') || 'feed') as 'feed' | 'recorder' | 'relay';
 
     if (!id) {
       return NextResponse.json(
@@ -260,6 +282,9 @@ export async function DELETE(req: NextRequest) {
     }
 
     if (USE_DATABASE) {
+      if (type === 'relay') {
+        return NextResponse.json({ error: 'Relay deletion not supported in database mode yet' }, { status: 400 });
+      }
       const result = await deleteFromSupabase(id, type);
       if (!result.success) {
         return NextResponse.json({ error: result.error }, { status: 400 });
@@ -270,6 +295,10 @@ export async function DELETE(req: NextRequest) {
 
       if (type === 'recorder') {
         data.recorders = data.recorders.filter(r => r.id !== id);
+      } else if (type === 'relay') {
+        if (data.relays) {
+          data.relays = data.relays.filter(r => r.id !== id);
+        }
       } else {
         data.feeds = data.feeds.filter(f => f.id !== id);
       }

@@ -9,3 +9,5 @@ export {
   CONTRACT_REGISTRY_ABI,
 } from './PoolPriceCustomFeed';
 
+// Phase 2: Cross-chain relay support
+export { PRICE_RELAY_ABI, PRICE_RELAY_BYTECODE } from './PriceRelay';

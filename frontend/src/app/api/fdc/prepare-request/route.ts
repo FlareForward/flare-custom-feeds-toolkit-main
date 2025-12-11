@@ -1,5 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
 // Verifier configuration by source chain
 const VERIFIER_CONFIG: Record<number, { path: string; sourceId: string }> = {
   // Flare Mainnet
@@ -32,6 +35,7 @@ const VERIFIER_BASE_URLS: Record<number, string> = {
 
 export async function POST(request: NextRequest) {
   try {
+    const requestId = crypto.randomUUID();
     const body = await request.json();
     
     // Support both old format (chainId only) and new format (flareChainId + sourceChainId)
@@ -63,12 +67,20 @@ export async function POST(request: NextRequest) {
     // Build the verifier URL
     const verifierUrl = `${baseUrl}/${sourceConfig.path}/EVMTransaction/prepareRequest`;
     
+    console.log('[FDC API]', requestId, 'sourceChainId:', effectiveSourceChainId, 'verifierUrl:', verifierUrl);
+    console.log('[FDC API]', requestId, 'forwardingBody:', JSON.stringify({ ...requestBody, sourceId: sourceConfig.sourceId }).substring(0, 500));
+    
     // Make the request to the verifier
     const response = await fetch(verifierUrl, {
       method: 'POST',
+      cache: 'no-store',
       headers: {
         'Content-Type': 'application/json',
         'X-API-KEY': '00000000-0000-0000-0000-000000000000', // Flare's public FDC verifier key
+        // Defensive: avoid intermediary caches returning stale INVALID responses
+        'Cache-Control': 'no-store',
+        'Pragma': 'no-cache',
+        'X-Request-Id': requestId,
       },
       body: JSON.stringify({
         ...requestBody,
@@ -78,20 +90,39 @@ export async function POST(request: NextRequest) {
 
     if (!response.ok) {
       const errorText = await response.text();
+      console.warn('[FDC API]', requestId, 'upstream non-OK:', response.status, errorText?.slice?.(0, 500));
       return NextResponse.json(
-        { error: `Verifier error: ${response.status} - ${errorText}` },
-        { status: response.status }
+        { error: `Verifier error: ${response.status} - ${errorText}`, requestId },
+        {
+          status: response.status,
+          headers: {
+            'Cache-Control': 'no-store',
+          },
+        }
       );
     }
 
     const data = await response.json();
-    return NextResponse.json(data);
+    console.log('[FDC API]', requestId, 'upstream status:', data?.status, 'hasAbiEncodedRequest:', !!data?.abiEncodedRequest);
+    return NextResponse.json(
+      { ...data, requestId },
+      {
+        headers: {
+          'Cache-Control': 'no-store',
+        },
+      }
+    );
 
   } catch (error) {
     console.error('FDC prepare request error:', error);
     return NextResponse.json(
       { error: error instanceof Error ? error.message : 'Unknown error' },
-      { status: 500 }
+      {
+        status: 500,
+        headers: {
+          'Cache-Control': 'no-store',
+        },
+      }
     );
   }
 }

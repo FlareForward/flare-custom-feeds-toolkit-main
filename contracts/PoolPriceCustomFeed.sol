@@ -368,6 +368,7 @@ contract PoolPriceCustomFeed is IICustomFeed {
      * @param sqrtPriceX96 Square root price in Q64.96 format
      * @return uint256 Price with DECIMALS precision
      * @dev Applies decimal adjustment for pools with different token decimals
+     * @dev Uses careful ordering of operations to avoid uint256 overflow
      */
     function _calculatePrice(
         uint160 sqrtPriceX96
@@ -378,33 +379,59 @@ contract PoolPriceCustomFeed is IICustomFeed {
         // actual_price = raw_price * 10^(decimals0 - decimals1)
 
         uint256 Q96 = 2 ** 96;
+        uint256 sqrtPrice = uint256(sqrtPriceX96);
 
-        // Calculate raw price with HIGH precision (18 decimals) to avoid losing precision
-        uint256 numerator = uint256(sqrtPriceX96) *
-            uint256(sqrtPriceX96) *
-            (10 ** 18);
-        uint256 denominator = Q96 * Q96;
-        uint256 price = numerator / denominator;
-
-        // Apply decimal adjustment if tokens have different decimals
-        int256 decimalAdjustment = int256(uint256(token0Decimals)) -
-            int256(uint256(token1Decimals));
-        if (decimalAdjustment > 0) {
-            // token0 has more decimals than token1
-            // Multiply by 10^(decimals0 - decimals1)
-            price = price * (10 ** uint256(decimalAdjustment));
-        } else if (decimalAdjustment < 0) {
-            // token1 has more decimals than token0
-            // Divide by 10^(decimals1 - decimals0)
-            price = price / (10 ** uint256(-decimalAdjustment));
+        // Calculate price carefully to avoid overflow
+        // We need: (sqrtPriceX96^2 / 2^192) * 10^18 * 10^(decimals0 - decimals1) / 10^12
+        // 
+        // For very large sqrtPriceX96 values (like USDC/WETH), sqrtPrice^2 can overflow uint256
+        // So we calculate in steps, dividing early to keep numbers manageable
+        
+        // First, divide sqrtPriceX96 by 2^48 to make the number smaller
+        // Then square it, then divide by 2^96 (instead of 2^192)
+        // This is equivalent but avoids overflow
+        uint256 priceNumerator;
+        uint256 priceDenominator;
+        
+        if (sqrtPrice > 2**128) {
+            // For very large sqrtPriceX96 (e.g., stablecoin/ETH pairs)
+            // sqrtPrice / 2^64, then square, gives us price * 2^64
+            uint256 sqrtPriceReduced = sqrtPrice / (2**64);
+            // sqrtPriceReduced^2 * 10^6 / 2^64 gives price in 6 decimals
+            priceNumerator = sqrtPriceReduced * sqrtPriceReduced;
+            priceDenominator = 2**64;
+        } else {
+            // For smaller sqrtPriceX96 values, use full precision
+            priceNumerator = sqrtPrice * sqrtPrice;
+            priceDenominator = Q96 * Q96;
         }
 
-        // Scale down from 18 decimals to 6 decimals for storage
-        price = price / (10 ** 12);
+        // Apply decimal adjustment BEFORE the division to maintain precision
+        // decimalAdjustment = token0Decimals - token1Decimals
+        int256 decimalAdjustment = int256(uint256(token0Decimals)) -
+            int256(uint256(token1Decimals));
+        
+        // We want final result in 6 decimals
+        // Start by scaling the numerator
+        uint256 scaledNumerator;
+        
+        if (decimalAdjustment >= 0) {
+            // token0 has more or equal decimals
+            // Scale up numerator by 10^(6 + adjustment)
+            scaledNumerator = priceNumerator * (10 ** (6 + uint256(decimalAdjustment)));
+        } else {
+            // token1 has more decimals
+            // We need to account for this in the denominator instead
+            scaledNumerator = priceNumerator * (10 ** 6);
+            priceDenominator = priceDenominator * (10 ** uint256(-decimalAdjustment));
+        }
+        
+        uint256 price = scaledNumerator / priceDenominator;
 
         // Apply price inversion if configured (for market convention)
         if (invertPrice && price > 0) {
             // Invert: 1 / price (maintaining 6 decimal precision)
+            // 10^12 / price gives us inverted price in 6 decimals
             price = (10 ** 12) / price;
         }
 

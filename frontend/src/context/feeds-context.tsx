@@ -1,7 +1,13 @@
 'use client';
 
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react';
-import type { FeedsData, StoredFeed, StoredRecorder, NetworkId } from '@/lib/types';
+import type { 
+  FeedsData, 
+  StoredFeed, 
+  StoredRecorder, 
+  NetworkId,
+  SourceChain,
+} from '@/lib/types';
 
 interface FeedsContextType {
   feeds: StoredFeed[];
@@ -13,8 +19,13 @@ interface FeedsContextType {
   addRecorder: (recorder: StoredRecorder) => Promise<void>;
   removeRecorder: (id: string) => Promise<void>;
   refresh: () => Promise<void>;
+  // Legacy helpers (for backward compatibility)
   getFeedsByNetwork: (network: NetworkId) => StoredFeed[];
   getRecordersByNetwork: (network: NetworkId) => StoredRecorder[];
+  // New cross-chain helpers
+  getFeedsBySourceChain: (chainId: number) => StoredFeed[];
+  getRecordersByChain: (chainId: number) => StoredRecorder[];
+  getNormalizedFeed: (feed: StoredFeed) => StoredFeed & { sourceChain: SourceChain; sourcePoolAddress: `0x${string}` };
 }
 
 const FeedsContext = createContext<FeedsContextType | null>(null);
@@ -81,12 +92,73 @@ export function FeedsProvider({ children }: { children: ReactNode }) {
     await refresh();
   };
 
+  // Legacy helper: filter feeds by network string
   const getFeedsByNetwork = (network: NetworkId) => {
-    return data.feeds.filter(f => f.network === network);
+    return data.feeds.filter(f => {
+      // If feed has sourceChain, check its id
+      if (f.sourceChain) {
+        const networkChainId = network === 'flare' ? 14 : 114;
+        return f.sourceChain.id === networkChainId;
+      }
+      // Fall back to legacy network field
+      return f.network === network;
+    });
   };
 
+  // Legacy helper: filter recorders by network string
   const getRecordersByNetwork = (network: NetworkId) => {
-    return data.recorders.filter(r => r.network === network);
+    return data.recorders.filter(r => {
+      // If recorder has chainId, check it
+      if (r.chainId !== undefined) {
+        const networkChainId = network === 'flare' ? 14 : 114;
+        return r.chainId === networkChainId;
+      }
+      // Fall back to legacy network field
+      return r.network === network;
+    });
+  };
+
+  // New helper: filter feeds by source chain ID
+  const getFeedsBySourceChain = (chainId: number) => {
+    return data.feeds.filter(f => {
+      // If feed has sourceChain, check its id
+      if (f.sourceChain) {
+        return f.sourceChain.id === chainId;
+      }
+      // Fall back to inferring from legacy network field
+      const inferredChainId = f.network === 'coston2' ? 114 : 14;
+      return inferredChainId === chainId;
+    });
+  };
+
+  // New helper: filter recorders by chain ID
+  const getRecordersByChain = (chainId: number) => {
+    return data.recorders.filter(r => {
+      // If recorder has chainId, check it
+      if (r.chainId !== undefined) {
+        return r.chainId === chainId;
+      }
+      // Fall back to inferring from legacy network field
+      const inferredChainId = r.network === 'coston2' ? 114 : 14;
+      return inferredChainId === chainId;
+    });
+  };
+
+  // Normalize a feed to ensure it has sourceChain and sourcePoolAddress
+  const getNormalizedFeed = (feed: StoredFeed): StoredFeed & { 
+    sourceChain: SourceChain; 
+    sourcePoolAddress: `0x${string}` 
+  } => {
+    // Infer chain from legacy 'network' field if sourceChain missing
+    const inferredChain: SourceChain = feed.network === 'coston2' 
+      ? { id: 114, name: 'Coston2', category: 'direct' as const }
+      : { id: 14, name: 'Flare', category: 'direct' as const };
+    
+    return {
+      ...feed,
+      sourceChain: feed.sourceChain ?? inferredChain,
+      sourcePoolAddress: feed.sourcePoolAddress ?? feed.poolAddress ?? '0x' as `0x${string}`,
+    };
   };
 
   return (
@@ -103,6 +175,9 @@ export function FeedsProvider({ children }: { children: ReactNode }) {
         refresh,
         getFeedsByNetwork,
         getRecordersByNetwork,
+        getFeedsBySourceChain,
+        getRecordersByChain,
+        getNormalizedFeed,
       }}
     >
       {children}
@@ -117,4 +192,3 @@ export function useFeeds() {
   }
   return ctx;
 }
-

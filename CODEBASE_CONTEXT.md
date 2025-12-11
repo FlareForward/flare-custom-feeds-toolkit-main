@@ -380,40 +380,80 @@ npm run bot:start
 - `CROSSCHAIN_PLAN.md` - Full cross-chain architecture and research findings
 - `README.md` - User-facing documentation and setup guide
 
-## Cross-Chain Extension (Planned)
+## Cross-Chain Support (Phase 1 Implemented)
 
-> See `CROSSCHAIN_CONTEXT.md` for implementation details.
+> See `CROSSCHAIN_CONTEXT.md` for execution details and `CROSSCHAIN_PLAN.md` for full architecture.
 
-The toolkit is being extended to support pools from **any EVM chain**:
+The toolkit supports pools from multiple EVM chains:
 
-| Source Chain | Flow | Trust Model |
-|--------------|------|-------------|
-| Flare, Ethereum | Direct | Trustless (FDC) |
-| Arbitrum, Base, OP, Polygon | Relay | Bot + FDC |
+| Source Chain | Flow | Trust Model | Status |
+|--------------|------|-------------|--------|
+| Flare | Direct | Trustless (FDC) | ✅ Active |
+| Ethereum | Direct | Trustless (FDC) | ✅ Phase 1 |
+| Sepolia (testnet) | Direct | Trustless (FDC) | ✅ Phase 1 |
+| Arbitrum, Base, OP, Polygon | Relay | Bot + FDC | ⏳ Phase 2+ |
 
 ### Schema Evolution (v1.0.0 → v2.0.0)
 
 **Backward compatible** - legacy feeds continue to work:
 
 ```typescript
-// Normalize legacy feeds when reading
+// Normalize legacy feeds when reading (in feeds-context.tsx)
 const sourceChain = feed.sourceChain ?? { id: 14, name: 'Flare', category: 'direct' };
-const poolAddress = feed.sourcePoolAddress ?? feed.poolAddress;
+const sourcePoolAddress = feed.sourcePoolAddress ?? feed.poolAddress;
 ```
 
 New fields in v2.0.0:
 - `sourceChain: { id, name, category }` - Where the pool lives
 - `sourcePoolAddress` - Pool address on source chain
-- `priceRelayAddress` - For relay chains only
+- `priceRelayAddress` - For relay chains only (Phase 2+)
+
+### Multi-Chain RPC Support
+
+Pool info is fetched from the source chain's RPC:
+
+```typescript
+// frontend/src/hooks/use-pool-info.ts
+// Automatically uses correct RPC based on chainId
+const { data: poolInfo } = usePoolInfo(poolAddress, sourceChainId);
+```
+
+### Network Switching Flow (Ethereum)
+
+For Ethereum pools, the update flow handles network switching:
+
+```
+1. User clicks "Update Feed"
+2. Switch to Ethereum → User confirms
+3. Record price on Ethereum (requires ETH for gas)
+4. Switch to Flare → User confirms
+5. Request FDC attestation (requires FLR)
+6. Wait for finalization (~2-5 min)
+7. Submit proof to feed contract
+```
 
 ### FDC Multi-Chain Support
 
-The FDC client will be extended to support multiple source IDs:
+The prepare-request API supports multiple source IDs:
 
-```javascript
-const SOURCE_IDS = {
-  14: '0x464c52...',    // FLR
-  1: '0x455448...',     // ETH
-  11155111: '0x746573...' // Sepolia (testnet)
+```typescript
+// frontend/src/app/api/fdc/prepare-request/route.ts
+const VERIFIER_CONFIG = {
+  14: { path: 'flr', sourceId: '0x464c52...' },    // Flare
+  1: { path: 'eth', sourceId: '0x455448...' },     // Ethereum
+  11155111: { path: 'sepolia', sourceId: '0x746573...' }, // Sepolia
 };
+```
+
+### New Files (Phase 1)
+
+```
+frontend/src/
+├── lib/
+│   └── chains.ts           # Chain configuration
+├── components/
+│   └── chain/
+│       ├── ChainSelector.tsx  # Chain dropdown
+│       └── index.ts
+└── (modified existing files for cross-chain support)
 ```

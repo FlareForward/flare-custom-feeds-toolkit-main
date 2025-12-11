@@ -11,6 +11,8 @@ import { useChainId, useReadContracts, useAccount } from 'wagmi';
 import { CUSTOM_FEED_ABI } from '@/lib/contracts';
 import { getExplorerUrl } from '@/lib/wagmi-config';
 import { useFeedUpdater, type UpdateStep } from '@/hooks/use-feed-updater';
+import { ChainBadge } from '@/components/chain';
+import { getChainById } from '@/lib/chains';
 import { 
   Activity, 
   ExternalLink, 
@@ -21,11 +23,12 @@ import {
   Clock,
   Play,
   X,
-  Loader2
+  Loader2,
+  ArrowRight
 } from 'lucide-react';
 import { toast } from 'sonner';
 import Link from 'next/link';
-import type { NetworkId, BotStatus, StoredFeed } from '@/lib/types';
+import type { BotStatus, StoredFeed, SourceChain } from '@/lib/types';
 
 function getBotStatus(lastUpdateTimestamp: number, updateInterval: number = 300): BotStatus {
   if (!lastUpdateTimestamp) return 'unknown';
@@ -61,8 +64,10 @@ function formatPrice(value: bigint | undefined): string {
 const STEP_PROGRESS: Record<UpdateStep, number> = {
   idle: 0,
   checking: 5,
+  'switching-to-source': 8,
   'enabling-pool': 10,
   recording: 15,
+  'switching-to-flare': 25,
   'requesting-attestation': 30,
   'waiting-finalization': 50,
   'retrieving-proof': 80,
@@ -76,9 +81,10 @@ interface FeedCardProps {
   chainId: number;
   onUpdateClick: () => void;
   isUpdating: boolean;
+  normalizedFeed: StoredFeed & { sourceChain: SourceChain; sourcePoolAddress: `0x${string}` };
 }
 
-function FeedCard({ feed, chainId, onUpdateClick, isUpdating }: FeedCardProps) {
+function FeedCard({ feed, chainId, onUpdateClick, isUpdating, normalizedFeed }: FeedCardProps) {
   const { data, isLoading, refetch } = useReadContracts({
     contracts: [
       {
@@ -110,6 +116,8 @@ function FeedCard({ feed, chainId, onUpdateClick, isUpdating }: FeedCardProps) {
   const feedId = data?.[3]?.result as string | undefined;
 
   const botStatus = getBotStatus(lastUpdateTimestamp);
+  const sourceChain = normalizedFeed.sourceChain;
+  const isFlareSource = sourceChain.id === 14 || sourceChain.id === 114;
 
   const statusConfig = {
     active: { color: 'bg-green-500', text: 'Active', icon: CheckCircle2 },
@@ -132,9 +140,19 @@ function FeedCard({ feed, chainId, onUpdateClick, isUpdating }: FeedCardProps) {
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0 flex-1">
             <CardTitle className="text-lg truncate">{feed.alias}</CardTitle>
-            <Badge variant="outline" className="font-mono text-xs mt-1">
-              {feed.token0.symbol}/{feed.token1.symbol}
-            </Badge>
+            <div className="flex items-center gap-2 mt-1 flex-wrap">
+              <Badge variant="outline" className="font-mono text-xs">
+                {feed.token0.symbol}/{feed.token1.symbol}
+              </Badge>
+              {/* Source chain indicator */}
+              {!isFlareSource && (
+                <div className="flex items-center gap-1 text-xs text-muted-foreground">
+                  <ChainBadge chainId={sourceChain.id} className="text-[10px] px-1.5" />
+                  <ArrowRight className="w-3 h-3" />
+                  <span>Flare</span>
+                </div>
+              )}
+            </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             <div className={`w-2 h-2 rounded-full ${status.color}`} />
@@ -164,10 +182,8 @@ function FeedCard({ feed, chainId, onUpdateClick, isUpdating }: FeedCardProps) {
             <div className="font-semibold">{updateCount}</div>
           </div>
           <div className="min-w-0">
-            <div className="text-xs text-muted-foreground">Feed ID</div>
-            <div className="font-mono text-xs truncate" title={feedId}>
-              {feedId ? `${feedId.slice(0, 16)}...` : '—'}
-            </div>
+            <div className="text-xs text-muted-foreground">Source</div>
+            <div className="font-semibold text-sm">{sourceChain.name}</div>
           </div>
         </div>
 
@@ -186,6 +202,11 @@ function FeedCard({ feed, chainId, onUpdateClick, isUpdating }: FeedCardProps) {
             <>
               <Play className="w-4 h-4 mr-2" />
               Update Feed
+              {!isFlareSource && (
+                <span className="ml-1 text-xs opacity-75">
+                  ({sourceChain.name} → Flare)
+                </span>
+              )}
             </>
           )}
         </Button>
@@ -205,7 +226,7 @@ function FeedCard({ feed, chainId, onUpdateClick, isUpdating }: FeedCardProps) {
             </Button>
           </div>
           <a
-            href={getExplorerUrl(chainId, 'address', feed.customFeedAddress)}
+            href={getExplorerUrl(14, 'address', feed.customFeedAddress)}
             target="_blank"
             rel="noopener noreferrer"
           >
@@ -305,11 +326,13 @@ function UpdateProgressModal({
   progress,
   onCancel,
   feedAddress,
+  sourceChainName,
 }: {
   isOpen: boolean;
   progress: { step: UpdateStep; message: string; elapsed?: number; error?: string; txHash?: string };
   onCancel: () => void;
   feedAddress?: string;
+  sourceChainName?: string;
 }) {
   if (!isOpen) return null;
 
@@ -354,6 +377,20 @@ function UpdateProgressModal({
             </p>
           )}
 
+          {progress.step === 'switching-to-source' && sourceChainName && (
+            <div className="p-3 rounded-lg bg-secondary/50 text-xs text-muted-foreground">
+              <p className="font-medium mb-1">🔄 Network Switch Required</p>
+              <p>Please approve switching to {sourceChainName} in your wallet to record the price.</p>
+            </div>
+          )}
+
+          {progress.step === 'switching-to-flare' && (
+            <div className="p-3 rounded-lg bg-secondary/50 text-xs text-muted-foreground">
+              <p className="font-medium mb-1">🔄 Switching Back to Flare</p>
+              <p>Please approve switching back to Flare for the attestation step.</p>
+            </div>
+          )}
+
           {progress.step === 'waiting-finalization' && (
             <div className="p-3 rounded-lg bg-secondary/50 text-xs text-muted-foreground">
               <p className="font-medium mb-1">⏱️ FDC Finalization</p>
@@ -383,16 +420,19 @@ function UpdateProgressModal({
 }
 
 export default function MonitorPage() {
-  const { feeds, recorders, isLoading, refresh } = useFeeds();
+  const { feeds, recorders, isLoading, refresh, getNormalizedFeed } = useFeeds();
   const chainId = useChainId();
   const { isConnected } = useAccount();
   const { updateFeed, progress, isUpdating, cancel } = useFeedUpdater();
   
   const [updatingFeedId, setUpdatingFeedId] = useState<string | null>(null);
 
-  const networkId: NetworkId = 'flare';
-  const networkFeeds = feeds.filter(f => f.network === networkId);
-  const networkRecorders = recorders.filter(r => r.network === networkId);
+  // Get all feeds (no longer filtered by network since feeds are always on Flare)
+  const allFeeds = feeds;
+  
+  // Get the currently updating feed for source chain name display
+  const updatingFeed = updatingFeedId ? allFeeds.find(f => f.id === updatingFeedId) : null;
+  const updatingNormalized = updatingFeed ? getNormalizedFeed(updatingFeed) : null;
 
   const handleUpdateFeed = async (feed: StoredFeed) => {
     if (!isConnected) {
@@ -400,8 +440,11 @@ export default function MonitorPage() {
       return;
     }
 
+    const normalized = getNormalizedFeed(feed);
+    const sourceChainId = normalized.sourceChain.id;
+
     // Find the recorder for this feed
-    const recorder = networkRecorders.find(r => r.address === feed.priceRecorderAddress);
+    const recorder = recorders.find(r => r.address === feed.priceRecorderAddress);
     if (!recorder) {
       toast.error('Price recorder not found');
       return;
@@ -411,9 +454,10 @@ export default function MonitorPage() {
 
     try {
       await updateFeed(
-        feed.priceRecorderAddress,
-        feed.poolAddress,
-        feed.customFeedAddress
+        feed.priceRecorderAddress!,
+        normalized.sourcePoolAddress,
+        feed.customFeedAddress,
+        sourceChainId
       );
       
       // Refresh feeds data after successful update
@@ -444,8 +488,11 @@ export default function MonitorPage() {
         <div className="flex items-center justify-between">
           <div>
             <h2 className="text-lg font-semibold">
-              {networkFeeds.length} Feed{networkFeeds.length !== 1 ? 's' : ''} on Mainnet
+              {allFeeds.length} Feed{allFeeds.length !== 1 ? 's' : ''} on Flare
             </h2>
+            <p className="text-sm text-muted-foreground">
+              Feeds can source prices from Flare, Ethereum, and Sepolia
+            </p>
           </div>
           <Button variant="outline" onClick={refresh}>
             <RefreshCw className="w-4 h-4 mr-2" />
@@ -458,17 +505,21 @@ export default function MonitorPage() {
           <div className="text-center py-12 text-muted-foreground">
             Loading feeds...
           </div>
-        ) : networkFeeds.length > 0 ? (
+        ) : allFeeds.length > 0 ? (
           <div className="grid md:grid-cols-2 xl:grid-cols-3 gap-6">
-            {networkFeeds.map((feed) => (
-              <FeedCard 
-                key={feed.id} 
-                feed={feed} 
-                chainId={chainId}
-                onUpdateClick={() => handleUpdateFeed(feed)}
-                isUpdating={isUpdating && updatingFeedId === feed.id}
-              />
-            ))}
+            {allFeeds.map((feed) => {
+              const normalized = getNormalizedFeed(feed);
+              return (
+                <FeedCard 
+                  key={feed.id} 
+                  feed={feed}
+                  normalizedFeed={normalized}
+                  chainId={chainId}
+                  onUpdateClick={() => handleUpdateFeed(feed)}
+                  isUpdating={isUpdating && updatingFeedId === feed.id}
+                />
+              );
+            })}
           </div>
         ) : (
           <Card className="border-dashed">
@@ -493,7 +544,8 @@ export default function MonitorPage() {
         isOpen={updatingFeedId !== null}
         progress={progress}
         onCancel={handleCloseModal}
-        feedAddress={networkFeeds.find(f => f.id === updatingFeedId)?.customFeedAddress}
+        feedAddress={updatingFeed?.customFeedAddress}
+        sourceChainName={updatingNormalized?.sourceChain.name}
       />
     </div>
   );

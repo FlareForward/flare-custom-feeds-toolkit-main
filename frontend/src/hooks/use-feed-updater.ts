@@ -1,24 +1,32 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import { usePublicClient, useWalletClient, useChainId } from 'wagmi';
-import { encodeAbiParameters, parseAbiParameters, decodeAbiParameters } from 'viem';
+import { usePublicClient, useWalletClient, useChainId, useSwitchChain } from 'wagmi';
+import { decodeAbiParameters, parseAbiParameters, createPublicClient, http } from 'viem';
+import { getChainById as getSourceChainById, type SupportedChain } from '@/lib/chains';
+import { flare, ethereum, sepolia } from '@/lib/wagmi-config';
 
-// FDC Contract Addresses
+// FDC Contract Addresses (on Flare)
 const FDC_CONFIG = {
   // Flare Mainnet
   14: {
     FDC_HUB: '0xc25c749DC27Efb1864Cb3DADa8845B7687eB2d44' as `0x${string}`,
     RELAY: '0x57a4c3676d08Aa5d15410b5A6A80fBcEF72f3F45' as `0x${string}`,
-    SOURCE_ID: '0x464c520000000000000000000000000000000000000000000000000000000000', // FLR
   },
   // Coston2 Testnet
   114: {
     FDC_HUB: '0x48aC463d7975828989331836548F74Cf28Fc1e60' as `0x${string}`,
     RELAY: '0x5CdF9eAF3EB8b44fB696984a1420B56A7575D250' as `0x${string}`,
-    SOURCE_ID: '0x7465737443324652000000000000000000000000000000000000000000000000', // testC2FR
   },
 } as const;
+
+// Source chain configurations for FDC attestation
+const SOURCE_CONFIG: Record<number, { sourceId: `0x${string}` }> = {
+  14: { sourceId: '0x464c520000000000000000000000000000000000000000000000000000000000' }, // FLR
+  1: { sourceId: '0x4554480000000000000000000000000000000000000000000000000000000000' },  // ETH
+  11155111: { sourceId: '0x7465737445544800000000000000000000000000000000000000000000000000' }, // testETH (Sepolia)
+  114: { sourceId: '0x7465737443324652000000000000000000000000000000000000000000000000' }, // testC2FR
+};
 
 // ABIs
 const FDC_HUB_ABI = [
@@ -202,8 +210,10 @@ const CUSTOM_FEED_ABI = [
 export type UpdateStep = 
   | 'idle'
   | 'checking'
+  | 'switching-to-source'
   | 'enabling-pool'
   | 'recording'
+  | 'switching-to-flare'
   | 'requesting-attestation'
   | 'waiting-finalization'
   | 'retrieving-proof'
@@ -223,17 +233,29 @@ interface UseFeedUpdaterResult {
   updateFeed: (
     priceRecorderAddress: `0x${string}`,
     poolAddress: `0x${string}`,
-    feedAddress: `0x${string}`
+    feedAddress: `0x${string}`,
+    sourceChainId?: number  // NEW: optional source chain ID
   ) => Promise<void>;
   progress: UpdateProgress;
   isUpdating: boolean;
   cancel: () => void;
 }
 
+// Get chain definition for viem client
+function getChainDefinition(chainId: number) {
+  switch (chainId) {
+    case 1: return ethereum;
+    case 11155111: return sepolia;
+    case 14: return flare;
+    default: return flare;
+  }
+}
+
 export function useFeedUpdater(): UseFeedUpdaterResult {
   const publicClient = usePublicClient();
   const { data: walletClient } = useWalletClient();
   const chainId = useChainId();
+  const { switchChainAsync } = useSwitchChain();
 
   const [progress, setProgress] = useState<UpdateProgress>({
     step: 'idle',
@@ -249,16 +271,27 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
   const updateFeed = useCallback(async (
     priceRecorderAddress: `0x${string}`,
     poolAddress: `0x${string}`,
-    feedAddress: `0x${string}`
+    feedAddress: `0x${string}`,
+    sourceChainId: number = 14  // Default to Flare if not specified
   ) => {
     if (!publicClient || !walletClient) {
       throw new Error('Wallet not connected');
     }
 
-    const config = FDC_CONFIG[chainId as keyof typeof FDC_CONFIG];
-    if (!config) {
-      throw new Error(`Unsupported network (chainId: ${chainId})`);
+    // Get FDC config for Flare (where attestation happens)
+    const fdcConfig = FDC_CONFIG[14]; // Always use Flare mainnet for FDC
+    if (!fdcConfig) {
+      throw new Error('FDC not available on this network');
     }
+
+    // Get source chain config
+    const sourceConfig = SOURCE_CONFIG[sourceChainId];
+    if (!sourceConfig) {
+      throw new Error(`Unsupported source chain ID: ${sourceChainId}`);
+    }
+
+    const sourceChain = getSourceChainById(sourceChainId);
+    const isFlareSource = sourceChainId === 14 || sourceChainId === 114;
 
     setIsUpdating(true);
     setCancelled(false);
@@ -274,10 +307,36 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
     };
 
     try {
-      // Step 1: Check if pool is enabled on recorder
+      // Step 1: If source chain is not Flare, switch to it
+      let currentChainId = chainId;
+      
+      if (!isFlareSource && currentChainId !== sourceChainId) {
+        updateProgress('switching-to-source', `Switching to ${sourceChain?.name || 'source chain'}...`);
+        
+        try {
+          await switchChainAsync({ chainId: sourceChainId });
+          currentChainId = sourceChainId;
+          // Small delay to let wallet client update
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        } catch (switchError) {
+          if ((switchError as Error).message?.includes('rejected')) {
+            throw new Error('Network switch rejected. Please switch manually and try again.');
+          }
+          throw switchError;
+        }
+      }
+
+      // Create a client for the source chain
+      const sourceChainDef = getChainDefinition(sourceChainId);
+      const sourceClient = createPublicClient({
+        chain: sourceChainDef,
+        transport: http(sourceChain?.rpcUrl),
+      });
+
+      // Step 2: Check if pool is enabled on recorder
       updateProgress('checking', 'Checking pool status...');
       
-      const isEnabled = await publicClient.readContract({
+      const isEnabled = await sourceClient.readContract({
         address: priceRecorderAddress,
         abi: PRICE_RECORDER_ABI,
         functionName: 'enabledPools',
@@ -296,19 +355,18 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
         });
 
         updateProgress('enabling-pool', 'Waiting for pool enable confirmation...');
-        const enableReceipt = await publicClient.waitForTransactionReceipt({ hash: enableHash });
+        const enableReceipt = await sourceClient.waitForTransactionReceipt({ hash: enableHash });
         
         if (enableReceipt.status === 'reverted') {
           throw new Error('Failed to enable pool on recorder');
         }
 
         updateProgress('enabling-pool', 'Pool enabled successfully! Continuing...');
-        // Small delay to let user see the success
         await new Promise(resolve => setTimeout(resolve, 1000));
       }
 
-      // Now check if can update (interval check)
-      const canUpdate = await publicClient.readContract({
+      // Check if can update (interval check)
+      const canUpdate = await sourceClient.readContract({
         address: priceRecorderAddress,
         abi: PRICE_RECORDER_ABI,
         functionName: 'canUpdate',
@@ -319,8 +377,13 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
         throw new Error('Pool cannot be updated yet (interval not elapsed). Please wait a few minutes.');
       }
 
-      // Step 2: Record price
-      updateProgress('recording', 'Recording price on-chain...');
+      if (cancelled) throw new Error('Cancelled by user');
+
+      // Step 3: Record price on source chain
+      const gasWarning = !isFlareSource 
+        ? ` (requires ${sourceChain?.nativeCurrency.symbol || 'gas'} for gas)` 
+        : '';
+      updateProgress('recording', `Recording price on ${sourceChain?.name || 'source chain'}${gasWarning}...`);
 
       const recordHash = await walletClient.writeContract({
         address: priceRecorderAddress,
@@ -331,7 +394,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
 
       updateProgress('recording', 'Waiting for confirmation...', { txHash: recordHash });
 
-      const recordReceipt = await publicClient.waitForTransactionReceipt({ hash: recordHash });
+      const recordReceipt = await sourceClient.waitForTransactionReceipt({ hash: recordHash });
       
       if (recordReceipt.status === 'reverted') {
         throw new Error('Record transaction reverted');
@@ -339,7 +402,29 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
 
       if (cancelled) throw new Error('Cancelled by user');
 
-      // Step 3: Request FDC attestation
+      // Step 4: Switch back to Flare for attestation (if on different chain)
+      if (!isFlareSource && currentChainId !== 14) {
+        updateProgress('switching-to-flare', 'Switching back to Flare for attestation...');
+        
+        try {
+          await switchChainAsync({ chainId: 14 });
+          currentChainId = 14;
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        } catch (switchError) {
+          if ((switchError as Error).message?.includes('rejected')) {
+            throw new Error('Network switch to Flare rejected. Please switch manually and try again.');
+          }
+          throw switchError;
+        }
+      }
+
+      // Create Flare client for attestation
+      const flareClient = createPublicClient({
+        chain: flare,
+        transport: http(),
+      });
+
+      // Step 5: Request FDC attestation
       updateProgress('requesting-attestation', 'Preparing attestation request...');
 
       // Call verifier API via our proxy to avoid CORS
@@ -349,9 +434,10 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          chainId,
+          flareChainId: 14,
+          sourceChainId: sourceChainId,
           attestationType: '0x45564d5472616e73616374696f6e000000000000000000000000000000000000',
-          sourceId: config.SOURCE_ID,
+          sourceId: sourceConfig.sourceId,
           requestBody: {
             transactionHash: recordHash,
             requiredConfirmations: '1',
@@ -377,13 +463,13 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
 
       let fee: bigint;
       try {
-        const feeConfigAddress = await publicClient.readContract({
-          address: config.FDC_HUB,
+        const feeConfigAddress = await flareClient.readContract({
+          address: fdcConfig.FDC_HUB,
           abi: FDC_HUB_ABI,
           functionName: 'fdcRequestFeeConfigurations',
         });
 
-        fee = await publicClient.readContract({
+        fee = await flareClient.readContract({
           address: feeConfigAddress,
           abi: FEE_CONFIG_ABI,
           functionName: 'getRequestFee',
@@ -398,24 +484,24 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
       updateProgress('requesting-attestation', `Submitting attestation request (fee: ${(Number(fee) / 1e18).toFixed(2)} FLR)...`);
 
       const attestHash = await walletClient.writeContract({
-        address: config.FDC_HUB,
+        address: fdcConfig.FDC_HUB,
         abi: FDC_HUB_ABI,
         functionName: 'requestAttestation',
         args: [requestBytes],
         value: fee,
       });
 
-      const attestReceipt = await publicClient.waitForTransactionReceipt({ hash: attestHash });
+      const attestReceipt = await flareClient.waitForTransactionReceipt({ hash: attestHash });
 
       if (attestReceipt.status === 'reverted') {
         throw new Error('Attestation request reverted');
       }
 
       // Get voting round ID
-      const block = await publicClient.getBlock({ blockNumber: attestReceipt.blockNumber });
+      const block = await flareClient.getBlock({ blockNumber: attestReceipt.blockNumber });
       
-      const votingRoundId = await publicClient.readContract({
-        address: config.RELAY,
+      const votingRoundId = await flareClient.readContract({
+        address: fdcConfig.RELAY,
         abi: RELAY_ABI,
         functionName: 'getVotingRoundId',
         args: [block.timestamp],
@@ -423,7 +509,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
 
       if (cancelled) throw new Error('Cancelled by user');
 
-      // Step 4: Wait for finalization
+      // Step 6: Wait for finalization
       updateProgress('waiting-finalization', `Waiting for FDC finalization (Round ${votingRoundId})...`);
 
       const maxWaitMs = 300000; // 5 minutes
@@ -433,8 +519,8 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
       while (Date.now() - waitStart < maxWaitMs) {
         if (cancelled) throw new Error('Cancelled by user');
 
-        const isFinalized = await publicClient.readContract({
-          address: config.RELAY,
+        const isFinalized = await flareClient.readContract({
+          address: fdcConfig.RELAY,
           abi: RELAY_ABI,
           functionName: 'isFinalized',
           args: [200n, votingRoundId], // 200 = EVMTransaction attestation type
@@ -456,14 +542,14 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
 
       if (cancelled) throw new Error('Cancelled by user');
 
-      // Step 5: Retrieve proof from DA Layer via our proxy
+      // Step 7: Retrieve proof from DA Layer via our proxy
       updateProgress('retrieving-proof', 'Retrieving proof from DA Layer...');
 
       const proofResponse = await fetch('/api/fdc/get-proof', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          chainId,
+          chainId: 14, // Always Flare for proof retrieval
           votingRoundId: Number(votingRoundId),
           requestBytes: requestBytes,
         }),
@@ -482,7 +568,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
 
       if (cancelled) throw new Error('Cancelled by user');
 
-      // Step 6: Parse and submit proof to feed
+      // Step 8: Parse and submit proof to feed
       updateProgress('submitting-proof', 'Submitting proof to feed contract...');
 
       // Decode the response
@@ -517,7 +603,13 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
             value: decodedResponse.responseBody.value,
             input: decodedResponse.responseBody.input,
             status: decodedResponse.responseBody.status,
-            events: decodedResponse.responseBody.events.map((event: any) => ({
+            events: decodedResponse.responseBody.events.map((event: {
+              logIndex: number | bigint;
+              emitterAddress: string;
+              topics: readonly `0x${string}`[];
+              data: `0x${string}`;
+              removed: boolean;
+            }) => ({
               logIndex: Number(event.logIndex),
               emitterAddress: event.emitterAddress,
               topics: event.topics,
@@ -535,7 +627,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
         args: [proofStruct],
       });
 
-      const updateReceipt = await publicClient.waitForTransactionReceipt({ hash: updateHash });
+      const updateReceipt = await flareClient.waitForTransactionReceipt({ hash: updateHash });
 
       if (updateReceipt.status === 'reverted') {
         throw new Error('Update proof transaction reverted');
@@ -555,7 +647,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
     } finally {
       setIsUpdating(false);
     }
-  }, [publicClient, walletClient, chainId, cancelled]);
+  }, [publicClient, walletClient, chainId, cancelled, switchChainAsync]);
 
   return {
     updateFeed,
@@ -564,4 +656,3 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
     cancel,
   };
 }
-

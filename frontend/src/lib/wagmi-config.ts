@@ -23,7 +23,34 @@ export const flare = {
   },
 } as const satisfies Chain;
 
-// Define Coston2 Testnet
+// Define Ethereum Mainnet (NEW)
+export const ethereum = {
+  id: 1,
+  name: 'Ethereum',
+  nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+  rpcUrls: {
+    default: { http: ['https://eth.llamarpc.com'] },
+  },
+  blockExplorers: {
+    default: { name: 'Etherscan', url: 'https://etherscan.io' },
+  },
+} as const satisfies Chain;
+
+// Define Sepolia Testnet (NEW - for testing)
+export const sepolia = {
+  id: 11155111,
+  name: 'Sepolia',
+  nativeCurrency: { name: 'Sepolia ETH', symbol: 'ETH', decimals: 18 },
+  rpcUrls: {
+    default: { http: ['https://rpc.sepolia.org'] },
+  },
+  blockExplorers: {
+    default: { name: 'Sepolia Etherscan', url: 'https://sepolia.etherscan.io' },
+  },
+  testnet: true,
+} as const satisfies Chain;
+
+// Define Coston2 Testnet (kept for reference)
 export const coston2 = {
   id: 114,
   name: 'Coston2',
@@ -37,8 +64,8 @@ export const coston2 = {
   testnet: true,
 } as const satisfies Chain;
 
-// Keep testnet definition for potential future use, but only expose mainnet in UI
-const chains = [flare] as const;
+// Include Ethereum + Sepolia in chains array for cross-chain support
+const chains = [flare, ethereum, sepolia] as const;
 
 // Custom wallet configuration - desktop/browser wallets only
 // WalletConnect removed to avoid API key requirements for this dev tool
@@ -67,13 +94,15 @@ export const config = createConfig({
   connectors,
   transports: {
     [flare.id]: http(),
+    [ethereum.id]: http(),
+    [sepolia.id]: http(),
   },
   ssr: true,
 });
 
 // Export for use in components
 export const supportedChains = chains;
-export type SupportedChainId = typeof flare.id;
+export type SupportedChainId = typeof flare.id | typeof ethereum.id | typeof sepolia.id;
 
 export function getChainById(chainId: number): Chain | undefined {
   return supportedChains.find(chain => chain.id === chainId);
@@ -84,4 +113,14 @@ export function getExplorerUrl(chainId: number, type: 'address' | 'tx', hash: st
   if (!chain?.blockExplorers?.default) return '#';
   const base = chain.blockExplorers.default.url;
   return type === 'address' ? `${base}/address/${hash}` : `${base}/tx/${hash}`;
+}
+
+// Check if a chain is Flare network (where feeds are deployed)
+export function isFlareNetwork(chainId: number): boolean {
+  return chainId === flare.id || chainId === coston2.id;
+}
+
+// Get the main Flare chain for feed deployment
+export function getFlareChain(): typeof flare {
+  return flare;
 }

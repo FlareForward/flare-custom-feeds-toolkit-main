@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Header } from '@/components/layout/header';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -12,7 +12,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { useFeeds } from '@/context/feeds-context';
 import { usePoolInfo } from '@/hooks/use-pool-info';
-import { useAccount, useChainId, usePublicClient, useWalletClient } from 'wagmi';
+import { useAccount, useChainId, usePublicClient, useWalletClient, useSwitchChain } from 'wagmi';
 import { toast } from 'sonner';
 import { v4 as uuidv4 } from 'uuid';
 import { 
@@ -23,14 +23,17 @@ import {
   Loader2, 
   AlertCircle,
   ExternalLink,
-  Copy
+  Copy,
+  Info
 } from 'lucide-react';
 import { getExplorerUrl } from '@/lib/wagmi-config';
-import type { NetworkId } from '@/lib/types';
+import { ChainSelector, ChainBadge } from '@/components/chain';
+import { getChainById, isDirectChain, getChainExplorerUrl } from '@/lib/chains';
+import type { SourceChain } from '@/lib/types';
 import Link from 'next/link';
 import { PRICE_RECORDER_ABI, PRICE_RECORDER_BYTECODE } from '@/lib/artifacts/PriceRecorder';
 import { POOL_PRICE_CUSTOM_FEED_ABI, POOL_PRICE_CUSTOM_FEED_BYTECODE, CONTRACT_REGISTRY, CONTRACT_REGISTRY_ABI } from '@/lib/artifacts/PoolPriceCustomFeed';
-import { getAddress } from 'viem';
+import { getAddress, createPublicClient, http } from 'viem';
 
 type DeployStep = 'select' | 'configure' | 'review' | 'deploying' | 'success' | 'error';
 
@@ -40,9 +43,18 @@ export default function DeployPage() {
   const chainId = useChainId();
   const publicClient = usePublicClient();
   const { data: walletClient } = useWalletClient();
+  const { switchChainAsync } = useSwitchChain();
 
-  const networkId: NetworkId = 'flare';
-  const networkRecorders = recorders.filter(r => r.network === networkId);
+  // Source chain selection (NEW)
+  const [sourceChainId, setSourceChainId] = useState<number>(14); // Default to Flare
+  const sourceChain = getChainById(sourceChainId);
+
+  // Filter recorders by selected source chain
+  const chainRecorders = recorders.filter(r => {
+    // Legacy recorders without chainId are assumed to be on Flare
+    const recorderChainId = r.chainId ?? 14;
+    return recorderChainId === sourceChainId;
+  });
 
   // Deploy type selection
   const [deployType, setDeployType] = useState<'recorder' | 'feed' | null>(null);
@@ -60,9 +72,10 @@ export default function DeployPage() {
   const [manualToken0Decimals, setManualToken0Decimals] = useState('');
   const [manualToken1Decimals, setManualToken1Decimals] = useState('');
 
-  // Pool auto-detection
+  // Pool auto-detection (with source chain RPC)
   const { data: poolInfo, isLoading: poolLoading } = usePoolInfo(
-    poolAddress.length === 42 ? poolAddress : undefined
+    poolAddress.length === 42 ? poolAddress : undefined,
+    sourceChainId
   );
 
   // Deploy state
@@ -70,6 +83,11 @@ export default function DeployPage() {
   const [deployedAddress, setDeployedAddress] = useState<string>('');
   const [txHash, setTxHash] = useState<string>('');
   const [error, setError] = useState<string>('');
+
+  // Reset selected recorder when chain changes
+  useEffect(() => {
+    setSelectedRecorder('');
+  }, [sourceChainId]);
 
   const handleReset = () => {
     setDeployType(null);
@@ -87,6 +105,9 @@ export default function DeployPage() {
     setError('');
   };
 
+  // Check if we need to switch networks for deployment
+  const needsNetworkSwitch = sourceChainId !== chainId;
+
   const handleDeployRecorder = async () => {
     if (!walletClient || !publicClient || !address) {
       toast.error('Wallet not connected');
@@ -100,11 +121,26 @@ export default function DeployPage() {
     try {
       const interval = parseInt(updateInterval) || 300;
 
+      // If deploying on a different chain, switch to it
+      if (needsNetworkSwitch) {
+        toast.info(`Switching to ${sourceChain?.name}...`);
+        try {
+          await switchChainAsync({ chainId: sourceChainId });
+          // Wait for wallet to update
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } catch (switchError) {
+          if ((switchError as Error).message?.includes('rejected')) {
+            throw new Error('Network switch rejected');
+          }
+          throw switchError;
+        }
+      }
+
       toast.info('Deploying PriceRecorder...', {
-        description: `Update interval: ${interval}s`,
+        description: `Update interval: ${interval}s on ${sourceChain?.name}`,
       });
 
-      // Deploy the PriceRecorder contract
+      // Deploy the PriceRecorder contract on the source chain
       const hash = await walletClient.deployContract({
         abi: PRICE_RECORDER_ABI,
         bytecode: PRICE_RECORDER_BYTECODE,
@@ -115,8 +151,15 @@ export default function DeployPage() {
       setTxHash(hash);
       toast.info('Transaction submitted, waiting for confirmation...');
 
+      // Create a client for the source chain to wait for receipt
+      const sourceClient = sourceChainId !== chainId && sourceChain 
+        ? createPublicClient({
+            transport: http(sourceChain.rpcUrl),
+          })
+        : publicClient;
+
       // Wait for deployment
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      const receipt = await sourceClient.waitForTransactionReceipt({ hash });
       
       if (!receipt.contractAddress) {
         throw new Error('Contract address not found in receipt');
@@ -125,17 +168,19 @@ export default function DeployPage() {
       const contractAddress = receipt.contractAddress;
       setDeployedAddress(contractAddress);
 
-      // Save to local storage
+      // Save to local storage with chain info
       addRecorder({
         id: uuidv4(),
         address: contractAddress as `0x${string}`,
-        network: networkId,
+        network: sourceChainId === 14 ? 'flare' : sourceChainId === 114 ? 'coston2' : undefined,
+        chainId: sourceChainId,
+        chainName: sourceChain?.name,
         updateInterval: interval,
         deployedAt: new Date().toISOString(),
         deployedBy: address,
       });
 
-      toast.success('PriceRecorder deployed successfully!');
+      toast.success(`PriceRecorder deployed on ${sourceChain?.name}!`);
       setStep('success');
 
     } catch (e) {
@@ -176,13 +221,27 @@ export default function DeployPage() {
     setError('');
 
     try {
+      // Feed contracts are ALWAYS deployed on Flare
+      if (chainId !== 14) {
+        toast.info('Switching to Flare for feed deployment...');
+        try {
+          await switchChainAsync({ chainId: 14 });
+          await new Promise(resolve => setTimeout(resolve, 1500));
+        } catch (switchError) {
+          if ((switchError as Error).message?.includes('rejected')) {
+            throw new Error('Network switch to Flare rejected');
+          }
+          throw switchError;
+        }
+      }
+
       const token0Dec = parseInt(manualToken0Decimals) || poolInfo?.token0Decimals || 18;
       const token1Dec = parseInt(manualToken1Decimals) || poolInfo?.token1Decimals || 18;
 
-      // Get the ContractRegistry address for the current network
-      const registryAddress = CONTRACT_REGISTRY[chainId as keyof typeof CONTRACT_REGISTRY];
+      // Get the ContractRegistry address for Flare mainnet
+      const registryAddress = CONTRACT_REGISTRY[14 as keyof typeof CONTRACT_REGISTRY];
       if (!registryAddress) {
-        throw new Error(`Unsupported network (chainId: ${chainId})`);
+        throw new Error('Contract registry not found for Flare');
       }
 
       toast.info('Fetching FdcVerification address...', {
@@ -201,8 +260,8 @@ export default function DeployPage() {
         throw new Error('FdcVerification address not found in registry');
       }
 
-      toast.info('Deploying PoolPriceCustomFeed...', {
-        description: `${feedAlias} for pool ${poolAddress.slice(0, 10)}...`,
+      toast.info('Deploying PoolPriceCustomFeed on Flare...', {
+        description: `${feedAlias} for pool on ${sourceChain?.name}`,
       });
 
       // Properly checksum all addresses
@@ -210,13 +269,13 @@ export default function DeployPage() {
       const checksummedPool = getAddress(poolAddress);
       const checksummedFdc = getAddress(fdcVerificationAddress);
 
-      // Deploy the PoolPriceCustomFeed contract
+      // Deploy the PoolPriceCustomFeed contract on Flare
       const hash = await walletClient.deployContract({
         abi: POOL_PRICE_CUSTOM_FEED_ABI,
         bytecode: POOL_PRICE_CUSTOM_FEED_BYTECODE,
         args: [
-          checksummedRecorder,  // _priceRecorder
-          checksummedPool,      // _poolAddress
+          checksummedRecorder,  // _priceRecorder (on source chain)
+          checksummedPool,      // _poolAddress (on source chain)
           feedAlias,            // _feedName
           checksummedFdc,       // _fdcVerificationAddress
           token0Dec,            // _token0Decimals
@@ -229,7 +288,7 @@ export default function DeployPage() {
       setTxHash(hash);
       toast.info('Transaction submitted, waiting for confirmation...');
 
-      // Wait for deployment
+      // Wait for deployment on Flare
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
       
       if (!receipt.contractAddress) {
@@ -239,14 +298,27 @@ export default function DeployPage() {
       const contractAddress = receipt.contractAddress;
       setDeployedAddress(contractAddress);
 
-      // Save to local storage
+      // Build source chain object for v2.0.0 schema
+      const sourceChainData: SourceChain = {
+        id: sourceChainId,
+        name: sourceChain?.name || 'Unknown',
+        category: 'direct',
+      };
+
+      // Save to local storage with cross-chain info
       addFeed({
         id: uuidv4(),
         alias: feedAlias,
-        network: networkId,
+        // v2.0.0 schema fields
+        sourceChain: sourceChainData,
+        sourcePoolAddress: poolAddress as `0x${string}`,
+        // Legacy fields for backward compatibility
+        network: 'flare', // Feed is always on Flare
         poolAddress: poolAddress as `0x${string}`,
+        // Flare deployment
         customFeedAddress: contractAddress as `0x${string}`,
         priceRecorderAddress: selectedRecorder as `0x${string}`,
+        // Token info
         token0: {
           address: poolInfo?.token0 || '0x0000000000000000000000000000000000000000' as `0x${string}`,
           symbol: poolInfo?.token0Symbol || 'TOKEN0',
@@ -262,7 +334,7 @@ export default function DeployPage() {
         deployedBy: address,
       });
 
-      toast.success('Custom Feed deployed successfully!');
+      toast.success('Custom Feed deployed on Flare!');
       setStep('success');
 
     } catch (e) {
@@ -279,6 +351,20 @@ export default function DeployPage() {
     toast.success('Copied to clipboard');
   };
 
+  // Get explorer URL based on where contract was deployed
+  const getDeployedContractExplorerUrl = () => {
+    if (!deployedAddress) return '#';
+    // Recorders are deployed on source chain, feeds are always on Flare
+    const explorerChainId = deployType === 'recorder' ? sourceChainId : 14;
+    return getChainExplorerUrl(explorerChainId, 'address', deployedAddress);
+  };
+
+  const getDeployedTxExplorerUrl = () => {
+    if (!txHash) return '#';
+    const explorerChainId = deployType === 'recorder' ? sourceChainId : 14;
+    return getChainExplorerUrl(explorerChainId, 'tx', txHash);
+  };
+
   return (
     <div className="min-h-screen">
       <Header 
@@ -287,6 +373,25 @@ export default function DeployPage() {
       />
 
       <div className="p-6 max-w-4xl mx-auto space-y-6">
+        {/* Source Chain Selection (shown at top when selecting deploy type) */}
+        {step === 'select' && !deployType && (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-lg">Source Chain</CardTitle>
+              <CardDescription>
+                Select which chain your Uniswap V3 pool is on
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <ChainSelector
+                value={sourceChainId}
+                onChange={setSourceChainId}
+                showGasWarning={false}
+              />
+            </CardContent>
+          </Card>
+        )}
+
         {/* Step: Select Deploy Type */}
         {step === 'select' && (
           <div className="grid md:grid-cols-2 gap-6">
@@ -302,21 +407,26 @@ export default function DeployPage() {
                 </div>
                 <CardTitle>Price Recorder</CardTitle>
                 <CardDescription>
-                  Deploy a new PriceRecorder contract to capture pool prices on-chain
+                  Deploy a PriceRecorder on {sourceChain?.name || 'the source chain'} to capture pool prices
                 </CardDescription>
               </CardHeader>
-              <CardContent>
+              <CardContent className="space-y-2">
                 <Badge variant="outline">Required first</Badge>
+                {sourceChainId !== 14 && (
+                  <p className="text-xs text-muted-foreground">
+                    Requires {sourceChain?.nativeCurrency.symbol} for deployment
+                  </p>
+                )}
               </CardContent>
             </Card>
 
             <Card 
               className={`cursor-pointer transition-all ${
-                networkRecorders.length === 0 
+                chainRecorders.length === 0 
                   ? 'opacity-50 cursor-not-allowed' 
                   : 'hover:border-brand-500'
               } ${deployType === 'feed' ? 'border-brand-500 bg-brand-500/5' : ''}`}
-              onClick={() => networkRecorders.length > 0 && setDeployType('feed')}
+              onClick={() => chainRecorders.length > 0 && setDeployType('feed')}
             >
               <CardHeader>
                 <div className="w-12 h-12 rounded-xl bg-brand-500/10 flex items-center justify-center mb-4">
@@ -324,14 +434,14 @@ export default function DeployPage() {
                 </div>
                 <CardTitle>Custom Feed</CardTitle>
                 <CardDescription>
-                  Create a new custom price feed for a Uniswap V3 pool
+                  Create a custom price feed on Flare for a pool on {sourceChain?.name || 'the source chain'}
                 </CardDescription>
               </CardHeader>
               <CardContent>
-                {networkRecorders.length === 0 ? (
-                  <Badge variant="secondary">Deploy recorder first</Badge>
+                {chainRecorders.length === 0 ? (
+                  <Badge variant="secondary">Deploy recorder on {sourceChain?.name} first</Badge>
                 ) : (
-                  <Badge variant="outline">{networkRecorders.length} recorder(s) available</Badge>
+                  <Badge variant="outline">{chainRecorders.length} recorder(s) on {sourceChain?.name}</Badge>
                 )}
               </CardContent>
             </Card>
@@ -342,12 +452,25 @@ export default function DeployPage() {
         {step === 'select' && deployType === 'recorder' && (
           <Card>
             <CardHeader>
-              <CardTitle>Configure Price Recorder</CardTitle>
+              <div className="flex items-center gap-2">
+                <CardTitle>Configure Price Recorder</CardTitle>
+                <ChainBadge chainId={sourceChainId} />
+              </div>
               <CardDescription>
-                Set the update interval for price recordings
+                This contract will be deployed on {sourceChain?.name}
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
+              {/* Gas warning for non-Flare chains */}
+              {sourceChainId !== 14 && (
+                <Alert className="bg-blue-50 border-blue-200 dark:bg-blue-950 dark:border-blue-900">
+                  <Info className="h-4 w-4 text-blue-600" />
+                  <AlertDescription className="text-sm">
+                    You need <strong>{sourceChain?.nativeCurrency.symbol}</strong> on {sourceChain?.name} for deployment and future price recordings.
+                  </AlertDescription>
+                </Alert>
+              )}
+
               <div className="space-y-2">
                 <Label htmlFor="updateInterval">Update Interval (seconds)</Label>
                 <Input
@@ -372,7 +495,7 @@ export default function DeployPage() {
                   onClick={handleDeployRecorder}
                 >
                   <Rocket className="w-4 h-4 mr-2" />
-                  Deploy Recorder
+                  Deploy on {sourceChain?.name}
                 </Button>
               </div>
             </CardContent>
@@ -383,22 +506,36 @@ export default function DeployPage() {
         {step === 'select' && deployType === 'feed' && (
           <Card>
             <CardHeader>
-              <CardTitle>Configure Custom Feed</CardTitle>
+              <div className="flex items-center gap-2">
+                <CardTitle>Configure Custom Feed</CardTitle>
+                <Badge variant="outline">Feed on Flare</Badge>
+              </div>
               <CardDescription>
-                Enter the V3 pool details to create your custom feed
+                Pool on {sourceChain?.name} → Feed on Flare (FDC verified)
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6">
+              {/* Info about cross-chain flow */}
+              {sourceChainId !== 14 && (
+                <Alert className="bg-blue-50 border-blue-200 dark:bg-blue-950 dark:border-blue-900">
+                  <Info className="h-4 w-4 text-blue-600" />
+                  <AlertDescription className="text-sm">
+                    <strong>Cross-Chain Flow:</strong> Prices are recorded on {sourceChain?.name}, 
+                    then verified by FDC and stored on Flare. Updates require {sourceChain?.nativeCurrency.symbol} + FLR.
+                  </AlertDescription>
+                </Alert>
+              )}
+
               {/* Recorder Selection */}
               <div className="space-y-2">
-                <Label>Price Recorder</Label>
+                <Label>Price Recorder on {sourceChain?.name}</Label>
                 <select
                   className="w-full h-10 px-3 py-2 rounded-md border border-input bg-background text-sm"
                   value={selectedRecorder}
                   onChange={(e) => setSelectedRecorder(e.target.value)}
                 >
                   <option value="">Select a recorder...</option>
-                  {networkRecorders.map((r) => (
+                  {chainRecorders.map((r) => (
                     <option key={r.id} value={r.address}>
                       {r.address.slice(0, 10)}...{r.address.slice(-8)} (interval: {r.updateInterval}s)
                     </option>
@@ -408,7 +545,7 @@ export default function DeployPage() {
 
               {/* Pool Address */}
               <div className="space-y-2">
-                <Label htmlFor="poolAddress">V3 Pool Address</Label>
+                <Label htmlFor="poolAddress">V3 Pool Address on {sourceChain?.name}</Label>
                 <Input
                   id="poolAddress"
                   value={poolAddress}
@@ -418,14 +555,14 @@ export default function DeployPage() {
                 {poolLoading && (
                   <p className="text-sm text-muted-foreground flex items-center gap-2">
                     <Loader2 className="w-3 h-3 animate-spin" />
-                    Loading pool info...
+                    Loading pool info from {sourceChain?.name}...
                   </p>
                 )}
                 {poolInfo && (
                   <div className="p-3 rounded-lg bg-secondary/50 space-y-1">
                     <p className="text-sm font-medium flex items-center gap-2">
                       <CheckCircle2 className="w-4 h-4 text-green-500" />
-                      Pool detected
+                      Pool detected on {sourceChain?.name}
                     </p>
                     <p className="text-sm text-muted-foreground">
                       {poolInfo.token0Symbol}/{poolInfo.token1Symbol} ({poolInfo.token0Decimals}/{poolInfo.token1Decimals} decimals)
@@ -441,7 +578,7 @@ export default function DeployPage() {
                   id="feedAlias"
                   value={feedAlias}
                   onChange={(e) => setFeedAlias(e.target.value.toUpperCase().replace(/[^A-Z0-9_]/g, ''))}
-                  placeholder="e.g., WFLR_USDT"
+                  placeholder="e.g., WETH_USDC"
                   maxLength={20}
                 />
                 <p className="text-sm text-muted-foreground">
@@ -512,7 +649,7 @@ export default function DeployPage() {
                   disabled={!selectedRecorder || !poolAddress || !feedAlias}
                 >
                   <Rocket className="w-4 h-4 mr-2" />
-                  Deploy Feed
+                  Deploy Feed on Flare
                 </Button>
               </div>
             </CardContent>
@@ -539,7 +676,7 @@ export default function DeployPage() {
               <CheckCircle2 className="w-12 h-12 text-green-500 mx-auto mb-4" />
               <h3 className="text-lg font-semibold mb-2">Deployment Successful!</h3>
               <p className="text-muted-foreground mb-6">
-                Your contract has been deployed successfully.
+                Your contract has been deployed on {deployType === 'recorder' ? sourceChain?.name : 'Flare'}.
               </p>
               
               <div className="max-w-md mx-auto space-y-3">
@@ -558,7 +695,7 @@ export default function DeployPage() {
                       <Copy className="w-4 h-4" />
                     </Button>
                     <a
-                      href={getExplorerUrl(chainId, 'address', deployedAddress)}
+                      href={getDeployedContractExplorerUrl()}
                       target="_blank"
                       rel="noopener noreferrer"
                     >
@@ -573,7 +710,7 @@ export default function DeployPage() {
                   <div className="flex items-center justify-between p-3 rounded-lg bg-secondary">
                     <span className="text-sm text-muted-foreground">Transaction</span>
                     <a
-                      href={getExplorerUrl(chainId, 'tx', txHash)}
+                      href={getDeployedTxExplorerUrl()}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="text-sm text-brand-500 hover:underline flex items-center gap-1"
@@ -583,6 +720,12 @@ export default function DeployPage() {
                     </a>
                   </div>
                 )}
+
+                {/* Show chain info */}
+                <div className="flex items-center justify-between p-3 rounded-lg bg-secondary">
+                  <span className="text-sm text-muted-foreground">Deployed on</span>
+                  <ChainBadge chainId={deployType === 'recorder' ? sourceChainId : 14} />
+                </div>
               </div>
 
               <div className="flex flex-col items-center gap-3 mt-6">
@@ -636,14 +779,16 @@ export default function DeployPage() {
         )}
 
         {/* Info about existing recorders */}
-        {step === 'select' && !deployType && networkRecorders.length > 0 && (
+        {step === 'select' && !deployType && chainRecorders.length > 0 && (
           <Card>
             <CardHeader>
-              <CardTitle className="text-sm font-medium">Existing Recorders on Mainnet</CardTitle>
+              <CardTitle className="text-sm font-medium">
+                Existing Recorders on {sourceChain?.name}
+              </CardTitle>
             </CardHeader>
             <CardContent>
               <div className="space-y-2">
-                {networkRecorders.map((r) => (
+                {chainRecorders.map((r) => (
                   <div key={r.id} className="flex items-center justify-between p-3 rounded-lg bg-secondary/50">
                     <div>
                       <code className="text-sm font-mono">{r.address}</code>
@@ -652,7 +797,7 @@ export default function DeployPage() {
                       </p>
                     </div>
                     <a
-                      href={getExplorerUrl(chainId, 'address', r.address)}
+                      href={getChainExplorerUrl(sourceChainId, 'address', r.address)}
                       target="_blank"
                       rel="noopener noreferrer"
                     >
@@ -670,4 +815,3 @@ export default function DeployPage() {
     </div>
   );
 }
-

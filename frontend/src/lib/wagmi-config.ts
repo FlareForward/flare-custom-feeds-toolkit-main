@@ -10,6 +10,13 @@ import {
 } from '@rainbow-me/rainbowkit/wallets';
 import { type Chain } from 'viem';
 
+type WagmiGlobal = typeof globalThis & {
+  __flareForwardWagmiConnectors?: ReturnType<typeof connectorsForWallets>;
+  __flareForwardWagmiConfig?: ReturnType<typeof createConfig>;
+};
+
+const wagmiGlobal = globalThis as WagmiGlobal;
+
 // Define Flare Mainnet
 export const flare = {
   id: 14,
@@ -70,35 +77,43 @@ const chains = [flare, ethereum, sepolia] as const;
 // Custom wallet configuration - desktop/browser wallets only
 // WalletConnect removed to avoid API key requirements for this dev tool
 // Users can add WalletConnect support by getting a free Project ID at https://cloud.walletconnect.com/
-const connectors = connectorsForWallets(
-  [
+const connectors =
+  wagmiGlobal.__flareForwardWagmiConnectors ??
+  (wagmiGlobal.__flareForwardWagmiConnectors = connectorsForWallets(
+    [
+      {
+        groupName: 'Wallets',
+        wallets: [
+          injectedWallet,    // Detects ANY injected wallet (Rabby, MetaMask, etc.)
+          rabbyWallet,       // Explicit Rabby support
+          metaMaskWallet,    // MetaMask
+          coinbaseWallet,    // Coinbase Wallet
+        ],
+      },
+    ],
     {
-      groupName: 'Wallets',
-      wallets: [
-        injectedWallet,    // Detects ANY injected wallet (Rabby, Frame, etc.)
-        rabbyWallet,       // Explicit Rabby support
-        metaMaskWallet,    // MetaMask
-        coinbaseWallet,    // Coinbase Wallet
-      ],
-    },
-  ],
-  {
-    appName: 'Flare Custom Feeds',
-    projectId: 'flare-custom-feeds', // Required by RainbowKit but not used without WalletConnect
-  }
-);
+      appName: 'Flare Custom Feeds',
+      // If you want to enable WalletConnect in the future, set a real project id:
+      // NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID=...
+      projectId: process.env.NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID || 'flare-custom-feeds',
+    }
+  ));
 
 // Create wagmi config with custom connectors
-export const config = createConfig({
-  chains,
-  connectors,
-  transports: {
-    [flare.id]: http(),
-    [ethereum.id]: http(),
-    [sepolia.id]: http(),
-  },
-  ssr: true,
-});
+export const config =
+  wagmiGlobal.__flareForwardWagmiConfig ??
+  (wagmiGlobal.__flareForwardWagmiConfig = createConfig({
+    chains,
+    connectors,
+    transports: {
+      [flare.id]: http(),
+      [ethereum.id]: http(),
+      [sepolia.id]: http(),
+    },
+    // Providers live in a client component; avoid SSR hydration mode which can
+    // cause repeated connector initialization under dev/HMR.
+    ssr: false,
+  }));
 
 // Export for use in components
 export const supportedChains = chains;

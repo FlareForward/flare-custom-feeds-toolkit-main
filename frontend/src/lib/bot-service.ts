@@ -79,6 +79,23 @@ const DEFAULT_CONFIG: BotConfig = {
   selectedFeedIds: undefined,
 };
 
+function toViemChain(chainId: number, chain: SupportedChain): Chain {
+  return {
+    id: chainId,
+    name: chain.name,
+    nativeCurrency: chain.nativeCurrency,
+    rpcUrls: { default: { http: [chain.rpcUrl] } },
+    blockExplorers: { default: { name: `${chain.name} Explorer`, url: chain.explorerUrl } },
+  } as const satisfies Chain;
+}
+
+function getRequiredConfirmations(chainId: number): number {
+  // Conservative defaults to reduce verifier flakiness.
+  if (chainId === 1) return 12; // ETH mainnet
+  if (chainId === 11155111) return 6; // Sepolia
+  return 1; // Flare + other direct test cases
+}
+
 const CUSTOM_FEED_ABI = parseAbi([
   'function updateFromProof((bytes32[] merkleProof, (bytes32 attestationType, bytes32 sourceId, uint64 votingRound, uint64 lowestUsedTimestamp, (bytes32 transactionHash, uint16 requiredConfirmations, bool provideInput, bool listEvents, uint32[] logIndices) requestBody, (uint64 blockNumber, uint64 timestamp, address sourceAddress, bool isDeployment, address receivingAddress, uint256 value, bytes input, uint8 status, (uint32 logIndex, address emitterAddress, bytes32[] topics, bytes data, bool removed)[] events) responseBody) data) _proof) external',
   'function latestValue() view returns (uint256)',
@@ -389,14 +406,43 @@ export class BotService {
     // Step 1: Record price on source chain
     this.log('info', `  📝 Recording price on ${sourceChain?.name}...`);
 
-    // For non-Flare source chains, we need to use a different wallet client
-    // For now, we only support Flare source chain in the bot
-    // TODO: Add multi-chain wallet support
-    if (sourceChainId !== 14) {
-      throw new Error(`Direct bot updates for ${sourceChain?.name} not yet supported. Use frontend or deploy recorder on Flare.`);
+    if (!sourceChain) {
+      throw new Error(`Unknown source chain: ${sourceChainId}`);
+    }
+    if (!feed.priceRecorderAddress) {
+      throw new Error('Missing priceRecorderAddress for direct feed');
     }
 
-    const recordHash = await this.walletClient.writeContract({
+    // Create source-chain clients (Flare uses the existing clients)
+    const requiredConfirmations = getRequiredConfirmations(sourceChainId);
+    const sourceClient =
+      sourceChainId === 14
+        ? this.flareClient
+        : createPublicClient({
+            chain: toViemChain(sourceChainId, sourceChain),
+            transport: http(sourceChain.rpcUrl),
+          });
+
+    const sourceWalletClient =
+      sourceChainId === 14
+        ? this.walletClient
+        : createWalletClient({
+            account: this.walletClient.account!,
+            chain: toViemChain(sourceChainId, sourceChain),
+            transport: http(sourceChain.rpcUrl),
+          });
+
+    // Optional: warn if balance looks low on non-Flare source chains
+    if (sourceChainId !== 14) {
+      try {
+        const bal = await sourceClient.getBalance({ address: this.walletClient.account!.address });
+        this.log('info', `  💰 Source balance: ${formatEther(bal)} ${sourceChain.nativeCurrency.symbol}`);
+      } catch {
+        // ignore
+      }
+    }
+
+    const recordHash = await sourceWalletClient.writeContract({
       address: feed.priceRecorderAddress!,
       abi: PRICE_RECORDER_ABI,
       functionName: 'recordPrice',
@@ -405,13 +451,26 @@ export class BotService {
 
     this.log('info', `  ✅ Recorded, tx: ${recordHash.slice(0, 10)}...`);
 
-    // Wait for the tx to be mined + give indexer a moment, so verifier doesn't flap INVALID.
-    await this.flareClient.waitForTransactionReceipt({ hash: recordHash });
-    await new Promise(resolve => setTimeout(resolve, 5_000));
+    // Wait for source tx confirmations (important for ETH verifier stability)
+    const receipt = await sourceClient.waitForTransactionReceipt({ hash: recordHash });
+    if (requiredConfirmations > 1) {
+      this.log('info', `  ⏳ Waiting for ${requiredConfirmations} confirmations on ${sourceChain.name}...`);
+      while (true) {
+        const latest = await sourceClient.getBlockNumber();
+        const confs = Number(latest - receipt.blockNumber + 1n);
+        if (confs >= requiredConfirmations) break;
+        await new Promise(resolve => setTimeout(resolve, 12_000));
+      }
+      // Buffer for verifier/indexer ingestion (ETH can be very slow)
+      await new Promise(resolve => setTimeout(resolve, 300_000));
+    } else {
+      // Small buffer for Flare verifier ingestion
+      await new Promise(resolve => setTimeout(resolve, 5_000));
+    }
 
     // Step 2-4: Request attestation, wait, submit proof
     // Call our API to handle the FDC flow
-    const result = await this.runFdcFlow(recordHash, feed, sourceChainId);
+    const result = await this.runFdcFlow(recordHash, feed, sourceChainId, requiredConfirmations);
 
     const duration = Date.now() - startTime;
     this.log('info', `  ✅ Feed updated in ${Math.floor(duration / 1000)}s`);
@@ -501,7 +560,7 @@ export class BotService {
     await new Promise(resolve => setTimeout(resolve, 5_000));
 
     // Step 3-5: Request attestation (for Flare tx), wait, submit proof
-    const result = await this.runFdcFlow(relayHash, feed, 14); // Relay tx is on Flare
+    const result = await this.runFdcFlow(relayHash, feed, 14, 1); // Relay tx is on Flare
 
     const duration = Date.now() - startTime;
     this.log('info', `  ✅ Relay feed updated in ${Math.floor(duration / 1000)}s`);
@@ -521,7 +580,12 @@ export class BotService {
     };
   }
 
-  private async runFdcFlow(txHash: string, feed: StoredFeed, sourceChainId: number): Promise<{ txHash: string; price?: string }> {
+  private async runFdcFlow(
+    txHash: string,
+    feed: StoredFeed,
+    sourceChainId: number,
+    requiredConfirmations: number
+  ): Promise<{ txHash: string; price?: string }> {
     // This calls the frontend API which handles the full FDC flow
     // In a production setup, you might want to implement this directly
     
@@ -530,7 +594,9 @@ export class BotService {
     // Step 1: Prepare attestation
     this.log('info', `  📨 Requesting attestation...`);
 
-    const maxWaitMs = sourceChainId === 1 ? 15 * 60_000 : 5 * 60_000;
+    // ETH verifier/indexer can lag significantly (10-25+ minutes observed on mainnet).
+    // Keep retrying without spending any FLR until we get abiEncodedRequest.
+    const maxWaitMs = sourceChainId === 1 ? 30 * 60_000 : 5 * 60_000;
     const retryDelayMs = sourceChainId === 1 ? 30_000 : 10_000;
     const startWait = Date.now();
     let attempt = 0;
@@ -550,7 +616,7 @@ export class BotService {
           sourceId: sourceConfig.sourceId,
           requestBody: {
             transactionHash: txHash,
-            requiredConfirmations: '1',
+            requiredConfirmations: String(requiredConfirmations),
             provideInput: false,
             listEvents: true,
             logIndices: [],
@@ -573,9 +639,13 @@ export class BotService {
       }
 
       // INVALID/unknown – verifier/indexer likely hasn't ingested yet, wait and retry
+      const waitedSeconds = Math.round((Date.now() - startWait) / 1000);
+      const waitedMin = Math.floor(waitedSeconds / 60);
+      const waitedSec = waitedSeconds % 60;
       this.log(
         'warn',
-        `  ⚠️ Verifier not ready (status: ${lastStatus || 'unknown'}). Retrying in ${Math.round(retryDelayMs / 1000)}s...` +
+        `  ⚠️ Verifier not ready (status: ${lastStatus || 'unknown'}). ` +
+          `Waited ${waitedMin}m ${waitedSec}s. Retrying in ${Math.round(retryDelayMs / 1000)}s...` +
           (lastRequestId ? ` (requestId: ${lastRequestId})` : '')
       );
       await new Promise(resolve => setTimeout(resolve, retryDelayMs));

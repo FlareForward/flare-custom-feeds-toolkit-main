@@ -141,14 +141,17 @@ export function ChainSelector({
 // Simple chain icon component
 function ChainIcon({ chainId }: { chainId: number }) {
   // Use colored circles with first letter as simple icons
-  const getChainStyle = (id: number) => {
+  const getChainStyle = (id: number): { bg: string; text: string } => {
     switch (id) {
+      // Direct chains
       case 14:
         return { bg: 'bg-[#E62058]', text: 'F' }; // Flare pink
       case 1:
         return { bg: 'bg-[#627EEA]', text: 'E' }; // Ethereum blue
       case 11155111:
         return { bg: 'bg-[#627EEA]', text: 'S' }; // Sepolia (Ethereum blue)
+      
+      // Relay chains - L2s
       case 42161:
         return { bg: 'bg-[#28A0F0]', text: 'A' }; // Arbitrum blue
       case 8453:
@@ -157,6 +160,37 @@ function ChainIcon({ chainId }: { chainId: number }) {
         return { bg: 'bg-[#FF0420]', text: 'O' }; // Optimism red
       case 137:
         return { bg: 'bg-[#8247E5]', text: 'P' }; // Polygon purple
+      case 1101:
+        return { bg: 'bg-[#8247E5]', text: 'zP' }; // Polygon zkEVM
+      
+      // Relay chains - Alt L1s
+      case 43114:
+        return { bg: 'bg-[#E84142]', text: 'Av' }; // Avalanche red
+      case 56:
+        return { bg: 'bg-[#F0B90B]', text: 'B' }; // BNB yellow
+      case 250:
+        return { bg: 'bg-[#1969FF]', text: 'Ft' }; // Fantom blue
+      case 100:
+        return { bg: 'bg-[#04795B]', text: 'G' }; // Gnosis green
+      case 42220:
+        return { bg: 'bg-[#FCFF52]', text: 'C' }; // Celo yellow
+      
+      // Relay chains - zkEVMs & newer L2s
+      case 324:
+        return { bg: 'bg-[#8C8DFC]', text: 'zk' }; // zkSync purple
+      case 59144:
+        return { bg: 'bg-[#121212]', text: 'L' }; // Linea black
+      case 534352:
+        return { bg: 'bg-[#FFEEDA]', text: 'Sc' }; // Scroll cream
+      case 5000:
+        return { bg: 'bg-[#000000]', text: 'M' }; // Mantle black
+      case 81457:
+        return { bg: 'bg-[#FCFC03]', text: 'Bl' }; // Blast yellow
+      case 34443:
+        return { bg: 'bg-[#DFFE00]', text: 'Mo' }; // Mode yellow-green
+      case 7777777:
+        return { bg: 'bg-[#000000]', text: 'Z' }; // Zora black
+      
       default:
         return { bg: 'bg-gray-500', text: '?' };
     }
@@ -164,9 +198,13 @@ function ChainIcon({ chainId }: { chainId: number }) {
 
   const style = getChainStyle(chainId);
   
+  // For light-colored backgrounds, use dark text
+  const lightBgs = ['bg-[#F0B90B]', 'bg-[#FCFF52]', 'bg-[#FFEEDA]', 'bg-[#FCFC03]', 'bg-[#DFFE00]'];
+  const textColor = lightBgs.includes(style.bg) ? 'text-black' : 'text-white';
+  
   return (
     <div className={`w-5 h-5 rounded-full ${style.bg} flex items-center justify-center`}>
-      <span className="text-white text-xs font-bold">{style.text}</span>
+      <span className={`${textColor} text-[9px] font-bold`}>{style.text}</span>
     </div>
   );
 }

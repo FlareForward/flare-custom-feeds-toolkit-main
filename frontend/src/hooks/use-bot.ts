@@ -10,7 +10,7 @@ interface UseBotResult {
   config: BotConfig | null;
   isLoading: boolean;
   error: string | null;
-  start: (privateKey?: string) => Promise<boolean>;
+  start: (options?: { privateKey?: string; config?: Partial<BotConfig>; feedIds?: string[] }) => Promise<boolean>;
   stop: () => Promise<boolean>;
   refresh: () => Promise<void>;
   updateSingleFeed: (feedId: string) => Promise<boolean>;
@@ -103,15 +103,19 @@ export function useBot(): UseBotResult {
   }, [refresh, connectStream]);
 
   // Start bot
-  const start = useCallback(async (privateKey?: string): Promise<boolean> => {
+  const start = useCallback(async (options?: { privateKey?: string; config?: Partial<BotConfig>; feedIds?: string[] }): Promise<boolean> => {
     setIsLoading(true);
     setError(null);
 
     try {
+      const privateKey = options?.privateKey;
+      const config = options?.config;
+      const feedIds = options?.feedIds;
+
       const response = await fetch('/api/bot/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ privateKey }),
+        body: JSON.stringify({ privateKey, config, feedIds }),
       });
 
       const data = await response.json();

@@ -8,15 +8,19 @@ import { botService } from '@/lib/bot-service';
  * Body (optional):
  * - privateKey: Override the default private key
  * - config: Bot configuration options
+ * - feedIds: Array of feed IDs to run (if omitted, runs all)
  */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json().catch(() => ({}));
-    const { privateKey, config } = body;
+    const { privateKey, config, feedIds } = body;
 
     // Update config if provided
-    if (config) {
-      botService.updateConfig(config);
+    if (config || feedIds) {
+      botService.updateConfig({
+        ...(config || {}),
+        ...(Array.isArray(feedIds) ? { selectedFeedIds: feedIds } : {}),
+      });
     }
 
     // Start the bot

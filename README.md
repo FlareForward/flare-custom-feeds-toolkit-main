@@ -87,6 +87,22 @@ cd flare-custom-feeds-toolkit/frontend
 npm install
 ```
 
+### Step 2: Add Your Environment Variables
+
+For **local development**, Next.js loads env vars from the **project root you run it from**.
+
+- **If you run the web app from `frontend/`** (recommended), put your env in: **`frontend/.env`**
+- **If you run Hardhat/CLI scripts from the repo root**, you can also use **repo-root `.env`** — but the toolkit will now also fallback to `frontend/.env` for convenience.
+
+Copy the template and fill in values:
+
+```bash
+# from the repo root
+cp .env.example frontend/.env
+```
+
+If you deploy on **Vercel**, you typically **do not commit any `.env` file**. Instead, set the same variables in **Vercel → Project → Settings → Environment Variables** (and make sure the Vercel project root is `frontend/`).
+
 ### Step 2: Start the App
 
 ```bash
@@ -219,9 +235,21 @@ Just click "Update Feed" in the Monitor page whenever you want fresh data.
 
 ### Option B: Automated Bot (Good for Production)
 
+You have two options:
+
+**B1) Built-in Bot (Web UI)**
+
+- Go to **Bot Control** in the dashboard
+- Select which feeds you want to run (**none selected by default**)
+  - **Ethereum feeds should run solo** (attestation/indexing can take much longer)
+- Click **Start Bot**
+  - Either paste a private key, or set `DEPLOYER_PRIVATE_KEY` in `frontend/.env`
+
+**B2) Standalone CLI Bot (Terminal)**
+
 1. Go to **Settings** in the dashboard
 2. Click **"Export Bot Config"**
-3. Copy the generated `.env` variables to your root `.env` file
+3. Copy the generated `.env` variables into **`frontend/.env`** (recommended), or repo-root `.env`
 4. Run the bot:
 
 ```bash

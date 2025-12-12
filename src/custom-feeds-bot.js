@@ -29,8 +29,10 @@ import fs from "fs";
 import path from "path";
 import { getProofForTransaction } from "./fdc-client.js";
 
-// Load .env file
-config();
+// Load .env file (prefer repo root, fallback to frontend/.env)
+const rootEnvPath = path.join(process.cwd(), ".env");
+const frontendEnvPath = path.join(process.cwd(), "frontend", ".env");
+config({ path: fs.existsSync(rootEnvPath) ? rootEnvPath : frontendEnvPath });
 
 // ============================================================
 // CONFIGURATION

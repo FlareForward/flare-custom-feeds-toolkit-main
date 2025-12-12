@@ -61,6 +61,11 @@ export interface BotConfig {
   maxRetries: number;
   privateKey?: string;
   autoStart: boolean;
+  /**
+   * If set, the bot only runs these feed IDs.
+   * If empty/undefined, the bot runs all configured feeds.
+   */
+  selectedFeedIds?: string[];
 }
 
 // ============================================================
@@ -71,6 +76,7 @@ const DEFAULT_CONFIG: BotConfig = {
   checkIntervalSeconds: 60,
   maxRetries: 2,
   autoStart: false,
+  selectedFeedIds: undefined,
 };
 
 const CUSTOM_FEED_ABI = parseAbi([
@@ -284,8 +290,15 @@ export class BotService {
       const response = await fetch(`${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/feeds`);
       if (response.ok) {
         const data: FeedsData = await response.json();
-        this.feeds = data.feeds || [];
+        const allFeeds = data.feeds || [];
         this.relays = data.relays || [];
+
+        const selected = this.config.selectedFeedIds;
+        if (Array.isArray(selected) && selected.length > 0) {
+          this.feeds = allFeeds.filter(f => selected.includes(f.id));
+        } else {
+          this.feeds = allFeeds;
+        }
       }
     } catch (error) {
       // Feeds loading failed, keep existing

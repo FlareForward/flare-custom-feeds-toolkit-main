@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Header } from '@/components/layout/header';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -8,6 +8,7 @@ import { Badge } from '@/components/ui/badge';
 import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
 import { useBot } from '@/hooks/use-bot';
 import { useFeeds } from '@/context/feeds-context';
 import { 
@@ -80,10 +81,48 @@ export default function BotPage() {
   const [privateKey, setPrivateKey] = useState('');
   const [isStarting, setIsStarting] = useState(false);
   const [isStopping, setIsStopping] = useState(false);
+  const [selectedFeedIds, setSelectedFeedIds] = useState<string[]>([]);
+  const didInitSelectionRef = useRef(false);
+
+  // Initialize selection from server config (or default to none).
+  // NOTE: We only do this once to avoid clobbering user selections during refreshes.
+  useEffect(() => {
+    if (didInitSelectionRef.current) return;
+
+    const configured = Array.isArray(config?.selectedFeedIds) ? config!.selectedFeedIds : [];
+    const valid = configured.filter((id) => feeds.some((f) => f.id === id));
+    setSelectedFeedIds(valid);
+    didInitSelectionRef.current = true;
+  }, [config, feeds]);
+
+  const selectedFeeds = useMemo(() => {
+    const byId = new Map(feeds.map(f => [f.id, f]));
+    return selectedFeedIds.map(id => byId.get(id)).filter(Boolean);
+  }, [feeds, selectedFeedIds]);
+
+  const hasEthSelected = useMemo(() => {
+    return selectedFeeds.some(f => (f?.sourceChain?.id ?? 14) === 1);
+  }, [selectedFeeds]);
+
+  const hasNonEthSelected = useMemo(() => {
+    return selectedFeeds.some(f => (f?.sourceChain?.id ?? 14) !== 1);
+  }, [selectedFeeds]);
 
   const handleStart = async () => {
+    if (selectedFeedIds.length === 0) {
+      toast.error('Select at least one feed to run');
+      return;
+    }
+    if (hasEthSelected && hasNonEthSelected) {
+      toast.error('ETH feeds must run solo. Deselect non-ETH feeds to continue.');
+      return;
+    }
+
     setIsStarting(true);
-    const success = await start(privateKey || undefined);
+    const success = await start({
+      privateKey: privateKey || undefined,
+      feedIds: selectedFeedIds,
+    });
     setIsStarting(false);
     
     if (success) {
@@ -282,6 +321,111 @@ export default function BotPage() {
             direct chains (Flare, Ethereum) and relay chains (Arbitrum, Base, etc.).
           </AlertDescription>
         </Alert>
+
+        {/* Bot Configuration */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Settings className="w-5 h-5" />
+              Bot Configuration
+            </CardTitle>
+            <CardDescription>
+              Choose which feeds the bot should run for before starting. (None selected by default.)
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="text-sm text-muted-foreground space-y-1">
+              <div>
+                - The bot will process the selected feeds in a round-robin loop at the configured interval.
+              </div>
+              <div>
+                - <strong>ETH mainnet rule:</strong> if you select an Ethereum feed, it must run solo (attestation/indexing can take much longer).
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setSelectedFeedIds(feeds.map(f => f.id))}
+                disabled={feeds.length === 0}
+              >
+                Select all
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setSelectedFeedIds([])}
+                disabled={feeds.length === 0}
+              >
+                Select none
+              </Button>
+              <div className="text-sm text-muted-foreground flex items-center">
+                Selected: {selectedFeedIds.length}/{feeds.length}
+              </div>
+            </div>
+
+            {feeds.length === 0 ? (
+              <Alert>
+                <AlertTriangle className="w-4 h-4" />
+                <AlertDescription>
+                  No feeds found. Deploy a feed first, then come back here to configure the bot.
+                </AlertDescription>
+              </Alert>
+            ) : (
+              <div className="space-y-3">
+                <div className="grid md:grid-cols-2 gap-3">
+                  {feeds.map((feed) => {
+                    const sourceChainId = feed.sourceChain?.id ?? 14;
+                    const isEth = sourceChainId === 1;
+                    const checked = selectedFeedIds.includes(feed.id);
+                    const disabled = !checked && hasEthSelected && !isEth;
+
+                    return (
+                      <label
+                        key={feed.id}
+                        className={`flex items-start gap-3 rounded-lg border p-3 cursor-pointer hover:bg-secondary/50 transition-colors ${
+                          disabled ? 'opacity-50 cursor-not-allowed' : ''
+                        }`}
+                      >
+                        <Checkbox
+                          checked={checked}
+                          disabled={disabled}
+                          onCheckedChange={(next) => {
+                            const isChecked = next === true;
+                            setSelectedFeedIds((prev) => {
+                              if (isChecked) {
+                                // Selecting ETH forces ETH-only selection
+                                if (isEth) return [feed.id];
+                                // If ETH already selected, block selecting non-ETH (also covered by disabled)
+                                if (hasEthSelected) return prev;
+                                return Array.from(new Set([...prev, feed.id]));
+                              }
+                              return prev.filter((id) => id !== feed.id);
+                            });
+                          }}
+                        />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="font-semibold truncate">{feed.alias}</div>
+                            <Badge variant="outline">
+                              {feed.sourceChain?.name ?? 'Flare'}
+                            </Badge>
+                          </div>
+                          <div className="text-xs text-muted-foreground mt-1">
+                            {isEth ? 'Ethereum feeds can take longer to attest — run solo.' : 'OK to run alongside other non-ETH feeds.'}
+                          </div>
+                        </div>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
 
         {/* Console Log */}
         <Card>

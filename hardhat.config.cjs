@@ -1,5 +1,12 @@
 require("@nomicfoundation/hardhat-ethers");
-require("dotenv").config();
+const fs = require("fs");
+const path = require("path");
+const dotenv = require("dotenv");
+
+// Prefer repo-root .env, fallback to frontend/.env (useful when hosting from /frontend)
+const rootEnvPath = path.join(__dirname, ".env");
+const frontendEnvPath = path.join(__dirname, "frontend", ".env");
+dotenv.config({ path: fs.existsSync(rootEnvPath) ? rootEnvPath : frontendEnvPath });
 
 /** @type import('hardhat/config').HardhatUserConfig */
 module.exports = {

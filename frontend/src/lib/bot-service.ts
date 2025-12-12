@@ -48,6 +48,8 @@ export interface BotStats {
   successfulUpdates: number;
   failedUpdates: number;
   lastUpdateTime: string | null;
+  lastCheckTime: string | null;
+  lastCheckNote: string | null;
   feedStats: Record<string, {
     updates: number;
     failures: number;
@@ -260,14 +262,20 @@ export class BotService {
   }
 
   private async tick(): Promise<void> {
+    // Update "last check" even if we skip due to long in-flight update.
+    this.stats.lastCheckTime = new Date().toISOString();
     // Prevent overlapping ticks (updates can take minutes due to FDC finalization).
-    if (this.tickInProgress) return;
+    if (this.tickInProgress) {
+      this.stats.lastCheckNote = 'Skipped: update already in progress';
+      return;
+    }
     this.tickInProgress = true;
     try {
       // Reload feeds to pick up changes
       await this.loadFeeds();
 
       if (this.feeds.length === 0) {
+        this.stats.lastCheckNote = 'No feeds configured';
         return;
       }
 
@@ -281,12 +289,17 @@ export class BotService {
       const canUpdate = await this.canUpdateFeed(feed);
       
       if (canUpdate) {
+        this.stats.lastCheckNote = `Updating: ${feed.alias}`;
         await this.updateFeed(feed);
+      } else {
+        this.stats.lastCheckNote = `Not ready: ${feed.alias}`;
+        this.log('debug', `⏭️ ${feed.alias} not eligible yet (interval not elapsed / canRelay=false).`);
       }
 
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
       this.log('error', `Error in main loop: ${message}`);
+      this.stats.lastCheckNote = `Error: ${message}`;
     } finally {
       this.tickInProgress = false;
     }
@@ -834,6 +847,8 @@ export class BotService {
       successfulUpdates: 0,
       failedUpdates: 0,
       lastUpdateTime: null,
+      lastCheckTime: null,
+      lastCheckNote: null,
       feedStats: {},
     };
   }

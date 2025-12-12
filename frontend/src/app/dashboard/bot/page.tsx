@@ -436,6 +436,26 @@ export default function BotPage() {
                 </div>
               </div>
 
+              <div className="mt-4 pt-4 border-t space-y-2">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">Loop interval</span>
+                  <span className="font-mono">
+                    {config?.checkIntervalSeconds ?? 60}s
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">Last check</span>
+                  <span className="font-mono">
+                    {stats?.lastCheckTime ? new Date(stats.lastCheckTime).toLocaleTimeString() : '—'}
+                  </span>
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  {stats?.lastCheckNote
+                    ? stats.lastCheckNote
+                    : 'Checks are skipped while an update is in progress (FDC can take minutes).'}
+                </div>
+              </div>
+
               {stats?.lastUpdateTime && (
                 <div className="mt-4 pt-4 border-t">
                   <div className="flex items-center gap-2 text-sm text-muted-foreground">

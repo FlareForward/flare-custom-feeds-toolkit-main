@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { botService } from '@/lib/bot-service';
+import { getBotService } from '@/lib/bot-service';
 
 /**
  * GET /api/bot/status
@@ -7,6 +7,7 @@ import { botService } from '@/lib/bot-service';
  */
 export async function GET() {
   try {
+    const botService = getBotService();
     const status = botService.getStatus();
     const stats = botService.getStats();
     const logs = botService.getLogs(50);

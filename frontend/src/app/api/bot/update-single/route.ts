@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { botService } from '@/lib/bot-service';
+import { getBotService } from '@/lib/bot-service';
 
 /**
  * POST /api/bot/update-single
@@ -10,6 +10,7 @@ import { botService } from '@/lib/bot-service';
  */
 export async function POST(request: NextRequest) {
   try {
+    const botService = getBotService();
     const body = await request.json();
     const { feedId } = body;
 

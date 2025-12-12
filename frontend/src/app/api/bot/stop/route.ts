@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { botService } from '@/lib/bot-service';
+import { getBotService, resetBotService } from '@/lib/bot-service';
 
 /**
  * POST /api/bot/stop
@@ -7,7 +7,10 @@ import { botService } from '@/lib/bot-service';
  */
 export async function POST() {
   try {
+    const botService = getBotService();
     await botService.stop();
+    // Reset the singleton so new code paths/config apply cleanly on next start
+    await resetBotService();
 
     return NextResponse.json({
       success: true,

@@ -72,17 +72,6 @@ export function Sidebar() {
         </Link>
       </div>
 
-      {/* Network Info */}
-      <div className="p-4 border-b border-border space-y-1">
-        <span className="text-sm text-muted-foreground">Network</span>
-        <Badge variant="outline" className="w-full justify-center">
-          Flare Mainnet
-        </Badge>
-        <p className="text-xs text-muted-foreground">
-          Testnet UI hidden for now.
-        </p>
-      </div>
-
       {/* Navigation */}
       <nav className="flex-1 p-4">
         <ul className="space-y-2">

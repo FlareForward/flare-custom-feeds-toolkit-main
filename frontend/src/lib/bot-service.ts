@@ -92,8 +92,6 @@ const CUSTOM_FEED_ABI = parseAbi([
 // ============================================================
 
 export class BotService {
-  private static instance: BotService | null = null;
-  
   private status: BotStatus = 'stopped';
   private config: BotConfig;
   private logs: BotLogEntry[] = [];
@@ -105,6 +103,7 @@ export class BotService {
   private feeds: StoredFeed[] = [];
   private relays: StoredRelay[] = [];
   private currentFeedIndex = 0;
+  private tickInProgress = false;
   
   // Event listeners for real-time updates
   private logListeners: Set<(entry: BotLogEntry) => void> = new Set();
@@ -113,16 +112,6 @@ export class BotService {
   private constructor(config: Partial<BotConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.stats = this.getEmptyStats();
-  }
-
-  // Singleton pattern for frontend use
-  static getInstance(config?: Partial<BotConfig>): BotService {
-    if (!BotService.instance) {
-      BotService.instance = new BotService(config);
-    } else if (config) {
-      BotService.instance.updateConfig(config);
-    }
-    return BotService.instance;
   }
 
   // For standalone CLI use
@@ -254,6 +243,9 @@ export class BotService {
   }
 
   private async tick(): Promise<void> {
+    // Prevent overlapping ticks (updates can take minutes due to FDC finalization).
+    if (this.tickInProgress) return;
+    this.tickInProgress = true;
     try {
       // Reload feeds to pick up changes
       await this.loadFeeds();
@@ -278,6 +270,8 @@ export class BotService {
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
       this.log('error', `Error in main loop: ${message}`);
+    } finally {
+      this.tickInProgress = false;
     }
   }
 
@@ -411,6 +405,10 @@ export class BotService {
 
     this.log('info', `  ✅ Recorded, tx: ${recordHash.slice(0, 10)}...`);
 
+    // Wait for the tx to be mined + give indexer a moment, so verifier doesn't flap INVALID.
+    await this.flareClient.waitForTransactionReceipt({ hash: recordHash });
+    await new Promise(resolve => setTimeout(resolve, 5_000));
+
     // Step 2-4: Request attestation, wait, submit proof
     // Call our API to handle the FDC flow
     const result = await this.runFdcFlow(recordHash, feed, sourceChainId);
@@ -462,6 +460,20 @@ export class BotService {
     const priceData = await priceResponse.json();
     this.log('info', `  ✅ Price fetched from block ${priceData.sourceBlockNumber}`);
 
+    // Defensive: ensure we never pass a "future" timestamp to PriceRelay.
+    // Some chains (e.g. Arbitrum) can run ahead of Flare by > MAX_FUTURE_SKEW, causing
+    // PriceRelay to revert with "Future timestamp". Using Flare time keeps the relay tx valid.
+    let safeSourceTimestamp = BigInt(priceData.sourceTimestamp);
+    try {
+      const flareBlock = await this.flareClient.getBlock();
+      const flareNow = flareBlock.timestamp;
+      if (safeSourceTimestamp > flareNow) {
+        safeSourceTimestamp = flareNow;
+      }
+    } catch {
+      // If we can't read Flare time, fall back to provided timestamp (may revert).
+    }
+
     // Step 2: Submit relay transaction on Flare
     this.log('info', `  📤 Relaying to Flare...`);
 
@@ -477,12 +489,16 @@ export class BotService {
         BigInt(priceData.liquidity),
         priceData.token0 as `0x${string}`,
         priceData.token1 as `0x${string}`,
-        BigInt(priceData.sourceTimestamp),
+        safeSourceTimestamp,
         BigInt(priceData.sourceBlockNumber),
       ],
     });
 
     this.log('info', `  ✅ Relayed, tx: ${relayHash.slice(0, 10)}...`);
+
+    // Wait for relay tx to be mined + small buffer for verifier indexer ingestion
+    await this.flareClient.waitForTransactionReceipt({ hash: relayHash });
+    await new Promise(resolve => setTimeout(resolve, 5_000));
 
     // Step 3-5: Request attestation (for Flare tx), wait, submit proof
     const result = await this.runFdcFlow(relayHash, feed, 14); // Relay tx is on Flare
@@ -513,30 +529,66 @@ export class BotService {
     
     // Step 1: Prepare attestation
     this.log('info', `  📨 Requesting attestation...`);
-    
-    const prepareResponse = await fetch(`${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/fdc/prepare-request`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        flareChainId: 14,
-        sourceChainId: sourceChainId,
-        attestationType: '0x45564d5472616e73616374696f6e000000000000000000000000000000000000',
-        sourceId: sourceConfig.sourceId,
-        requestBody: {
-          transactionHash: txHash,
-          requiredConfirmations: '1',
-          provideInput: false,
-          listEvents: true,
-          logIndices: [],
-        },
-      }),
-    });
 
-    if (!prepareResponse.ok) {
-      throw new Error('Failed to prepare attestation');
+    const maxWaitMs = sourceChainId === 1 ? 15 * 60_000 : 5 * 60_000;
+    const retryDelayMs = sourceChainId === 1 ? 30_000 : 10_000;
+    const startWait = Date.now();
+    let attempt = 0;
+    let abiEncodedRequest: `0x${string}` | undefined;
+    let lastStatus: string | undefined;
+    let lastRequestId: string | undefined;
+
+    while (Date.now() - startWait < maxWaitMs) {
+      attempt++;
+      const prepareResponse = await fetch(`${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/fdc/prepare-request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          flareChainId: 14,
+          sourceChainId: sourceChainId,
+          attestationType: '0x45564d5472616e73616374696f6e000000000000000000000000000000000000',
+          sourceId: sourceConfig.sourceId,
+          requestBody: {
+            transactionHash: txHash,
+            requiredConfirmations: '1',
+            provideInput: false,
+            listEvents: true,
+            logIndices: [],
+          },
+        }),
+      });
+
+      if (!prepareResponse.ok) {
+        const text = await prepareResponse.text().catch(() => '');
+        throw new Error(`Failed to prepare attestation (HTTP ${prepareResponse.status}). ${text?.slice?.(0, 200) || ''}`.trim());
+      }
+
+      const data = await prepareResponse.json().catch(() => ({} as any));
+      lastStatus = data?.status;
+      lastRequestId = data?.requestId;
+
+      if (data?.abiEncodedRequest) {
+        abiEncodedRequest = data.abiEncodedRequest as `0x${string}`;
+        break;
+      }
+
+      // INVALID/unknown – verifier/indexer likely hasn't ingested yet, wait and retry
+      this.log(
+        'warn',
+        `  ⚠️ Verifier not ready (status: ${lastStatus || 'unknown'}). Retrying in ${Math.round(retryDelayMs / 1000)}s...` +
+          (lastRequestId ? ` (requestId: ${lastRequestId})` : '')
+      );
+      await new Promise(resolve => setTimeout(resolve, retryDelayMs));
     }
 
-    const { abiEncodedRequest } = await prepareResponse.json();
+    if (!abiEncodedRequest) {
+      const waited = Math.round((Date.now() - startWait) / 1000);
+      throw new Error(
+        `FDC verifier did not return abiEncodedRequest after ${attempt} attempts (~${waited}s). ` +
+          `Last status: ${lastStatus || 'unknown'}.` +
+          (lastRequestId ? ` (requestId: ${lastRequestId})` : '')
+      );
+    }
 
     // Step 2: Submit attestation request
     const FDC_HUB = '0xc25c749DC27Efb1864Cb3DADa8845B7687eB2d44';
@@ -726,5 +778,50 @@ export class BotService {
   }
 }
 
-// Export singleton for API routes
-export const botService = BotService.getInstance();
+// ============================================================
+// SINGLETON WRAPPER (for API routes)
+//
+// Next.js dev/HMR can reload modules. To ensure ALL API routes share the same
+// running bot instance (and to avoid "UI says stopped but terminal shows running"),
+// store the singleton on globalThis.
+// ============================================================
+
+type BotGlobal = typeof globalThis & {
+  __flareForwardBotService?: BotService;
+  __flareForwardBotServiceVersion?: number;
+};
+
+const botGlobal = globalThis as BotGlobal;
+
+function ensureBotSingleton(): void {
+  if (!botGlobal.__flareForwardBotService) {
+    botGlobal.__flareForwardBotService = BotService.createInstance();
+    botGlobal.__flareForwardBotServiceVersion = 1;
+  }
+  if (!botGlobal.__flareForwardBotServiceVersion) {
+    botGlobal.__flareForwardBotServiceVersion = 1;
+  }
+}
+
+export function getBotService(): BotService {
+  ensureBotSingleton();
+  return botGlobal.__flareForwardBotService!;
+}
+
+export function getBotServiceVersion(): number {
+  ensureBotSingleton();
+  return botGlobal.__flareForwardBotServiceVersion || 1;
+}
+
+export async function resetBotService(): Promise<void> {
+  ensureBotSingleton();
+  try {
+    // Stop if running (best-effort)
+    await botGlobal.__flareForwardBotService!.stop();
+  } catch {
+    // ignore
+  }
+  const config = botGlobal.__flareForwardBotService!.getConfig();
+  botGlobal.__flareForwardBotService = BotService.createInstance(config);
+  botGlobal.__flareForwardBotServiceVersion = (botGlobal.__flareForwardBotServiceVersion || 1) + 1;
+}

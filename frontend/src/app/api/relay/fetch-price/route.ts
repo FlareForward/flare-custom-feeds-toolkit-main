@@ -15,6 +15,10 @@ import { SUPPORTED_CHAINS, isRelayChain } from '@/lib/chains';
  * - Returns all data needed for PriceRelay.relayPrice() call
  */
 
+// Used to defensively clamp timestamps so PriceRelay won't revert due to cross-chain clock skew
+const FLARE_RPC_URL = 'https://flare-api.flare.network/ext/bc/C/rpc';
+const MAX_FUTURE_SKEW_SECONDS = 600; // must match PriceRelay.MAX_FUTURE_SKEW
+
 const UNISWAP_V3_POOL_ABI = [
   {
     inputs: [],
@@ -137,6 +141,25 @@ export async function POST(request: NextRequest) {
     }
     
     // Return price data ready for PriceRelay.relayPrice()
+    const sourceTimestampRaw = Number(block.timestamp);
+    let sourceTimestamp = sourceTimestampRaw;
+    let sourceTimestampClamped = false;
+
+    // Defensive: some chains can run ahead of Flare by > MAX_FUTURE_SKEW.
+    // PriceRelay will revert with "Future timestamp" in that case.
+    try {
+      const flareClient = createPublicClient({ transport: http(FLARE_RPC_URL) });
+      const flareBlock = await flareClient.getBlock();
+      const flareNow = Number(flareBlock.timestamp);
+      const allowedMax = flareNow + MAX_FUTURE_SKEW_SECONDS;
+      if (sourceTimestamp > allowedMax) {
+        sourceTimestamp = allowedMax;
+        sourceTimestampClamped = true;
+      }
+    } catch {
+      // If Flare RPC fails, keep raw source timestamp; relay may revert but we avoid masking errors.
+    }
+
     return NextResponse.json({
       chainId,
       poolAddress,
@@ -147,10 +170,13 @@ export async function POST(request: NextRequest) {
       token1,
       // SECURITY: Use chain block timestamp, NOT Date.now()
       // This is critical for the freshness check in PriceRelay contract
-      sourceTimestamp: Number(block.timestamp),
+      sourceTimestamp,
       sourceBlockNumber: Number(blockNumber),
       // Include chain name for UX
       chainName: chain.name,
+      // Debug: indicates if timestamp was clamped to avoid "Future timestamp" reverts
+      sourceTimestampRaw,
+      sourceTimestampClamped,
     });
     
   } catch (error) {

@@ -9,6 +9,7 @@ import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Checkbox } from '@/components/ui/checkbox';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { useBot } from '@/hooks/use-bot';
 import { useFeeds } from '@/context/feeds-context';
 import { 
@@ -22,8 +23,8 @@ import {
   Terminal,
   Zap,
   AlertTriangle,
-  Info,
   Settings,
+  Maximize2,
   Loader2
 } from 'lucide-react';
 import { toast } from 'sonner';
@@ -83,6 +84,7 @@ export default function BotPage() {
   const [isStopping, setIsStopping] = useState(false);
   const [selectedFeedIds, setSelectedFeedIds] = useState<string[]>([]);
   const didInitSelectionRef = useRef(false);
+  const [isTerminalFullscreenOpen, setIsTerminalFullscreenOpen] = useState(false);
 
   // Initialize selection from server config (or default to none).
   // NOTE: We only do this once to avoid clobbering user selections during refreshes.
@@ -157,6 +159,25 @@ export default function BotPage() {
   const currentStatus = statusConfig[status];
   const StatusIcon = currentStatus.icon;
 
+  const startDisabledReason =
+    selectedFeedIds.length === 0
+      ? 'Select at least one feed above to enable Start.'
+      : hasEthSelected && hasNonEthSelected
+        ? 'ETH mainnet feeds must run solo. Deselect non-ETH feeds.'
+        : null;
+
+  const terminalInner = logs.length === 0 ? (
+    <div className="text-gray-500 text-center py-8">
+      No logs yet. Start the bot to see activity.
+    </div>
+  ) : (
+    <div className="space-y-0.5">
+      {logs.map((entry, i) => (
+        <LogEntry key={`${entry.timestamp}-${i}`} entry={entry} />
+      ))}
+    </div>
+  );
+
   return (
     <div className="min-h-screen">
       <Header 
@@ -165,164 +186,7 @@ export default function BotPage() {
       />
 
       <div className="p-6 space-y-6">
-        {/* Status and Control */}
-        <div className="grid md:grid-cols-2 gap-6">
-          {/* Status Card */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Activity className="w-5 h-5" />
-                Bot Status
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-4">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <div className={`w-4 h-4 rounded-full ${currentStatus.color}`} />
-                  <div>
-                    <p className="font-semibold text-lg flex items-center gap-2">
-                      <StatusIcon className={`w-4 h-4 ${status === 'running' ? 'animate-spin' : ''}`} />
-                      {currentStatus.text}
-                    </p>
-                    {stats?.startTime && status === 'running' && (
-                      <p className="text-sm text-muted-foreground">
-                        Uptime: {formatUptime(stats.uptimeSeconds)}
-                      </p>
-                    )}
-                  </div>
-                </div>
-                <Button variant="outline" size="sm" onClick={refresh}>
-                  <RefreshCw className="w-4 h-4" />
-                </Button>
-              </div>
-
-              {error && (
-                <Alert variant="destructive">
-                  <XCircle className="w-4 h-4" />
-                  <AlertDescription>{error}</AlertDescription>
-                </Alert>
-              )}
-
-              {/* Control Buttons */}
-              <div className="flex gap-3 pt-2">
-                {status === 'stopped' || status === 'error' ? (
-                  <>
-                    <Button 
-                      className="flex-1 bg-green-600 hover:bg-green-700"
-                      onClick={handleStart}
-                      disabled={isStarting || isLoading}
-                    >
-                      {isStarting ? (
-                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                      ) : (
-                        <Play className="w-4 h-4 mr-2" />
-                      )}
-                      Start Bot
-                    </Button>
-                    <Button 
-                      variant="outline"
-                      onClick={() => setShowPrivateKeyInput(!showPrivateKeyInput)}
-                    >
-                      <Settings className="w-4 h-4" />
-                    </Button>
-                  </>
-                ) : (
-                  <Button 
-                    className="flex-1"
-                    variant="destructive"
-                    onClick={handleStop}
-                    disabled={isStopping || status === 'stopping'}
-                  >
-                    {isStopping ? (
-                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                    ) : (
-                      <Square className="w-4 h-4 mr-2" />
-                    )}
-                    Stop Bot
-                  </Button>
-                )}
-              </div>
-
-              {/* Private Key Input (Optional) */}
-              {showPrivateKeyInput && status === 'stopped' && (
-                <div className="pt-4 border-t space-y-3">
-                  <div className="space-y-2">
-                    <Label htmlFor="privateKey">Private Key (optional)</Label>
-                    <Input
-                      id="privateKey"
-                      type="password"
-                      value={privateKey}
-                      onChange={(e) => setPrivateKey(e.target.value)}
-                      placeholder="0x... or leave blank to use env var"
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      If not provided, uses DEPLOYER_PRIVATE_KEY from environment
-                    </p>
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-
-          {/* Stats Card */}
-          <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
-                <Zap className="w-5 h-5" />
-                Statistics
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="p-3 rounded-lg bg-secondary/50">
-                  <div className="text-2xl font-bold">
-                    {stats?.totalUpdates || 0}
-                  </div>
-                  <div className="text-xs text-muted-foreground">Total Updates</div>
-                </div>
-                <div className="p-3 rounded-lg bg-secondary/50">
-                  <div className="text-2xl font-bold text-green-500">
-                    {stats?.successfulUpdates || 0}
-                  </div>
-                  <div className="text-xs text-muted-foreground">Successful</div>
-                </div>
-                <div className="p-3 rounded-lg bg-secondary/50">
-                  <div className="text-2xl font-bold text-red-500">
-                    {stats?.failedUpdates || 0}
-                  </div>
-                  <div className="text-xs text-muted-foreground">Failed</div>
-                </div>
-                <div className="p-3 rounded-lg bg-secondary/50">
-                  <div className="text-2xl font-bold">
-                    {feeds.length}
-                  </div>
-                  <div className="text-xs text-muted-foreground">Configured Feeds</div>
-                </div>
-              </div>
-
-              {stats?.lastUpdateTime && (
-                <div className="mt-4 pt-4 border-t">
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <Clock className="w-4 h-4" />
-                    Last update: {new Date(stats.lastUpdateTime).toLocaleString()}
-                  </div>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* Info Banner */}
-        <Alert className="bg-blue-50 border-blue-200 dark:bg-blue-950 dark:border-blue-900">
-          <Info className="w-4 h-4 text-blue-600" />
-          <AlertDescription className="text-sm">
-            <strong>About the Bot:</strong> When running, the bot automatically updates your deployed 
-            feeds at the configured interval. It handles the full FDC attestation workflow for both 
-            direct chains (Flare, Ethereum) and relay chains (Arbitrum, Base, etc.).
-          </AlertDescription>
-        </Alert>
-
-        {/* Bot Configuration */}
+        {/* Bot Configuration (1st) */}
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
@@ -427,33 +291,211 @@ export default function BotPage() {
           </CardContent>
         </Card>
 
-        {/* Console Log */}
+        {/* Status and Control */}
+        <div className="grid md:grid-cols-2 gap-6">
+          {/* Start/Status Card (2nd) */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Play className="w-5 h-5" />
+                Start Bot
+              </CardTitle>
+              <CardDescription>
+                Start/stop the bot and monitor its current status.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className={`w-4 h-4 rounded-full ${currentStatus.color}`} />
+                  <div>
+                    <p className="font-semibold text-lg flex items-center gap-2">
+                      <StatusIcon className={`w-4 h-4 ${status === 'running' ? 'animate-spin' : ''}`} />
+                      {currentStatus.text}
+                    </p>
+                    {stats?.startTime && status === 'running' && (
+                      <p className="text-sm text-muted-foreground">
+                        Uptime: {formatUptime(stats.uptimeSeconds)}
+                      </p>
+                    )}
+                  </div>
+                </div>
+                <Button variant="outline" size="sm" onClick={refresh}>
+                  <RefreshCw className="w-4 h-4" />
+                </Button>
+              </div>
+
+              {error && (
+                <Alert variant="destructive">
+                  <XCircle className="w-4 h-4" />
+                  <AlertDescription>{error}</AlertDescription>
+                </Alert>
+              )}
+
+              {/* Control Buttons */}
+              <div className="flex gap-3 pt-2">
+                {status === 'stopped' || status === 'error' ? (
+                  <>
+                    <Button 
+                      className="flex-1 bg-green-600 hover:bg-green-700"
+                      onClick={handleStart}
+                      disabled={isStarting || isLoading || !!startDisabledReason}
+                    >
+                      {isStarting ? (
+                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                      ) : (
+                        <Play className="w-4 h-4 mr-2" />
+                      )}
+                      Start Bot
+                    </Button>
+                    <Button 
+                      variant="outline"
+                      onClick={() => setShowPrivateKeyInput(!showPrivateKeyInput)}
+                    >
+                      <Settings className="w-4 h-4" />
+                    </Button>
+                  </>
+                ) : (
+                  <Button 
+                    className="flex-1"
+                    variant="destructive"
+                    onClick={handleStop}
+                    disabled={isStopping || status === 'stopping'}
+                  >
+                    {isStopping ? (
+                      <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                    ) : (
+                      <Square className="w-4 h-4 mr-2" />
+                    )}
+                    Stop Bot
+                  </Button>
+                )}
+              </div>
+
+              {startDisabledReason && (status === 'stopped' || status === 'error') && (
+                <Alert>
+                  <AlertTriangle className="w-4 h-4" />
+                  <AlertDescription>{startDisabledReason}</AlertDescription>
+                </Alert>
+              )}
+
+              {/* Private Key Input (Optional) */}
+              {showPrivateKeyInput && status === 'stopped' && (
+                <div className="pt-4 border-t space-y-3">
+                  <div className="space-y-2">
+                    <Label htmlFor="privateKey">Private Key (optional)</Label>
+                    <Input
+                      id="privateKey"
+                      type="password"
+                      value={privateKey}
+                      onChange={(e) => setPrivateKey(e.target.value)}
+                      placeholder="0x... or leave blank to use env var"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      If not provided, uses DEPLOYER_PRIVATE_KEY from environment
+                    </p>
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Stats Card */}
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Zap className="w-5 h-5" />
+                Statistics
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="p-3 rounded-lg bg-secondary/50">
+                  <div className="text-2xl font-bold">
+                    {stats?.totalUpdates || 0}
+                  </div>
+                  <div className="text-xs text-muted-foreground">Total Updates</div>
+                </div>
+                <div className="p-3 rounded-lg bg-secondary/50">
+                  <div className="text-2xl font-bold text-green-500">
+                    {stats?.successfulUpdates || 0}
+                  </div>
+                  <div className="text-xs text-muted-foreground">Successful</div>
+                </div>
+                <div className="p-3 rounded-lg bg-secondary/50">
+                  <div className="text-2xl font-bold text-red-500">
+                    {stats?.failedUpdates || 0}
+                  </div>
+                  <div className="text-xs text-muted-foreground">Failed</div>
+                </div>
+                <div className="p-3 rounded-lg bg-secondary/50">
+                  <div className="text-2xl font-bold">
+                    {feeds.length}
+                  </div>
+                  <div className="text-xs text-muted-foreground">Configured Feeds</div>
+                </div>
+              </div>
+
+              {stats?.lastUpdateTime && (
+                <div className="mt-4 pt-4 border-t">
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Clock className="w-4 h-4" />
+                    Last update: {new Date(stats.lastUpdateTime).toLocaleString()}
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Flare Forward Terminal (3rd) */}
         <Card>
           <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Terminal className="w-5 h-5" />
-              Console Log
-            </CardTitle>
-            <CardDescription>
-              Real-time bot activity log
-            </CardDescription>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <CardTitle className="flex items-center gap-2">
+                  <Terminal className="w-5 h-5" />
+                  Flare Forward Terminal
+                </CardTitle>
+                <CardDescription>
+                  Real-time bot activity log
+                </CardDescription>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => setIsTerminalFullscreenOpen(true)}
+              >
+                <Maximize2 className="w-4 h-4 mr-2" />
+                Full screen
+              </Button>
+            </div>
           </CardHeader>
           <CardContent>
             <div className="bg-black/90 rounded-lg p-4 h-80 overflow-y-auto font-mono text-sm">
-              {logs.length === 0 ? (
-                <div className="text-gray-500 text-center py-8">
-                  No logs yet. Start the bot to see activity.
-                </div>
-              ) : (
-                <div className="space-y-0.5">
-                  {logs.map((entry, i) => (
-                    <LogEntry key={`${entry.timestamp}-${i}`} entry={entry} />
-                  ))}
-                </div>
-              )}
+              {terminalInner}
             </div>
           </CardContent>
         </Card>
+
+        <Dialog open={isTerminalFullscreenOpen} onOpenChange={setIsTerminalFullscreenOpen}>
+          <DialogContent
+            className="sm:max-w-[calc(100%-2rem)] max-w-[calc(100%-2rem)] h-[calc(100%-2rem)] p-4 flex flex-col"
+          >
+            <DialogHeader className="shrink-0">
+              <DialogTitle className="flex items-center gap-2">
+                <Terminal className="w-5 h-5" />
+                Flare Forward Terminal
+              </DialogTitle>
+            </DialogHeader>
+            <div className="flex-1 min-h-0">
+              <div className="bg-black/90 rounded-lg p-4 h-full overflow-y-auto font-mono text-sm">
+                {terminalInner}
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
 
         {/* Feed Status Grid */}
         {feeds.length > 0 && (

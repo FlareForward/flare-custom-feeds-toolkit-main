@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { botService } from '@/lib/bot-service';
+import { getBotService } from '@/lib/bot-service';
 
 /**
  * POST /api/bot/start
@@ -12,6 +12,17 @@ import { botService } from '@/lib/bot-service';
  */
 export async function POST(request: NextRequest) {
   try {
+    const botService = getBotService();
+
+    // Idempotent start: if already running, return success
+    if (botService.getStatus() === 'running') {
+      return NextResponse.json({
+        success: true,
+        message: 'Bot is already running',
+        status: botService.getStatus(),
+      });
+    }
+
     const body = await request.json().catch(() => ({}));
     const { privateKey, config, feedIds } = body;
 

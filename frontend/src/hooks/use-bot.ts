@@ -93,9 +93,15 @@ export function useBot(): UseBotResult {
   useEffect(() => {
     refresh();
     const cleanup = connectStream();
+
+    // Defensive polling: ensures UI updates even if SSE is buffered/blocked in dev.
+    const poll = setInterval(() => {
+      refresh();
+    }, 3000);
     
     return () => {
       cleanup();
+      clearInterval(poll);
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
       }
@@ -122,18 +128,22 @@ export function useBot(): UseBotResult {
 
       if (data.success) {
         setStatus(data.status);
+        // Pull latest logs/status immediately (helps even if SSE isn't connected yet)
+        await refresh();
         return true;
       } else {
         setError(data.error || 'Failed to start bot');
+        await refresh();
         return false;
       }
     } catch (err) {
       setError('Failed to start bot');
+      await refresh();
       return false;
     } finally {
       setIsLoading(false);
     }
-  }, []);
+  }, [refresh]);
 
   // Stop bot
   const stop = useCallback(async (): Promise<boolean> => {

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Header } from '@/components/layout/header';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -28,17 +28,19 @@ import {
 } from 'lucide-react';
 import { toast } from 'sonner';
 import Link from 'next/link';
-import type { BotStatus, StoredFeed, SourceChain } from '@/lib/types';
+import type { StoredFeed, SourceChain } from '@/lib/types';
 
-function getBotStatus(lastUpdateTimestamp: number, updateInterval: number = 300): BotStatus {
-  if (!lastUpdateTimestamp) return 'unknown';
+type FeedFreshness = 'fresh' | 'aging' | 'old' | 'never';
+
+function getFeedFreshness(lastUpdateTimestamp: number, expectedIntervalSeconds: number = 300): FeedFreshness {
+  if (!lastUpdateTimestamp) return 'never';
   
   const now = Math.floor(Date.now() / 1000);
   const timeSinceUpdate = now - lastUpdateTimestamp;
   
-  if (timeSinceUpdate < updateInterval * 1.5) return 'active';
-  if (timeSinceUpdate < updateInterval * 5) return 'stale';
-  return 'inactive';
+  if (timeSinceUpdate < expectedIntervalSeconds * 1.5) return 'fresh';
+  if (timeSinceUpdate < expectedIntervalSeconds * 5) return 'aging';
+  return 'old';
 }
 
 function formatTimeAgo(timestamp: number): string {
@@ -86,9 +88,10 @@ interface FeedCardProps {
   onUpdateClick: () => void;
   isUpdating: boolean;
   normalizedFeed: StoredFeed & { sourceChain: SourceChain; sourcePoolAddress: `0x${string}` };
+  refreshKey: number;
 }
 
-function FeedCard({ feed, chainId, onUpdateClick, isUpdating, normalizedFeed }: FeedCardProps) {
+function FeedCard({ feed, chainId, onUpdateClick, isUpdating, normalizedFeed, refreshKey }: FeedCardProps) {
   const { data, isLoading, refetch } = useReadContracts({
     contracts: [
       {
@@ -119,20 +122,27 @@ function FeedCard({ feed, chainId, onUpdateClick, isUpdating, normalizedFeed }: 
   const updateCount = Number(data?.[2]?.result || 0);
   const feedId = data?.[3]?.result as string | undefined;
 
-  const botStatus = getBotStatus(lastUpdateTimestamp);
+  const freshness = getFeedFreshness(lastUpdateTimestamp);
   const sourceChain = normalizedFeed.sourceChain;
   const isFlareSource = sourceChain.id === 14 || sourceChain.id === 114;
   const isRelayFeed = sourceChain.category === 'relay';
 
   const statusConfig = {
-    active: { color: 'bg-green-500', text: 'Active', icon: CheckCircle2 },
-    stale: { color: 'bg-yellow-500', text: 'Stale', icon: Clock },
-    inactive: { color: 'bg-red-500', text: 'Inactive', icon: AlertCircle },
-    unknown: { color: 'bg-gray-500', text: 'Unknown', icon: Activity },
+    fresh: { color: 'bg-green-500', text: 'Fresh', icon: CheckCircle2 },
+    aging: { color: 'bg-yellow-500', text: 'Aging', icon: Clock },
+    old: { color: 'bg-red-500', text: 'Old', icon: AlertCircle },
+    never: { color: 'bg-gray-500', text: 'Never updated', icon: Activity },
   };
 
-  const status = statusConfig[botStatus];
+  const status = statusConfig[freshness];
   const StatusIcon = status.icon;
+
+  // Ensure cards update immediately after a successful update flow
+  useEffect(() => {
+    if (refreshKey > 0) {
+      refetch();
+    }
+  }, [refreshKey, refetch]);
 
   const copyToClipboard = (text: string, label: string) => {
     navigator.clipboard.writeText(text);
@@ -341,7 +351,16 @@ function UpdateProgressModal({
   sourceChainName,
 }: {
   isOpen: boolean;
-  progress: { step: UpdateStep; message: string; elapsed?: number; error?: string; txHash?: string };
+  progress: {
+    step: UpdateStep;
+    message: string;
+    elapsed?: number;
+    error?: string;
+    txHash?: string;
+    relayTxHash?: string;
+    attestationTxHash?: string;
+    updateTxHash?: string;
+  };
   onCancel: () => void;
   onRetryAttestation?: () => void;
   feedAddress?: string;
@@ -432,6 +451,50 @@ function UpdateProgressModal({
 
           {isSuccess && feedAddress && (
             <div className="border-t pt-4 mt-4">
+              <div className="space-y-3 mb-4">
+                <p className="text-sm font-medium">Verification evidence</p>
+                <div className="grid gap-2">
+                  {progress.attestationTxHash && (
+                    <a
+                      href={getExplorerUrl(14, 'tx', progress.attestationTxHash)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="w-full"
+                    >
+                      <Button variant="outline" className="w-full justify-between">
+                        View attestation request tx
+                        <ExternalLink className="w-4 h-4" />
+                      </Button>
+                    </a>
+                  )}
+                  {progress.updateTxHash && (
+                    <a
+                      href={getExplorerUrl(14, 'tx', progress.updateTxHash)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="w-full"
+                    >
+                      <Button variant="outline" className="w-full justify-between">
+                        View feed update tx (proof submitted)
+                        <ExternalLink className="w-4 h-4" />
+                      </Button>
+                    </a>
+                  )}
+                  {progress.relayTxHash && (
+                    <a
+                      href={getExplorerUrl(14, 'tx', progress.relayTxHash)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="w-full"
+                    >
+                      <Button variant="outline" className="w-full justify-between">
+                        View relay tx
+                        <ExternalLink className="w-4 h-4" />
+                      </Button>
+                    </a>
+                  )}
+                </div>
+              </div>
               <IntegrationSnippets feedAddress={feedAddress} />
             </div>
           )}
@@ -469,6 +532,7 @@ export default function MonitorPage() {
   const { updateFeed, progress, isUpdating, cancel } = useFeedUpdater();
   
   const [updatingFeedId, setUpdatingFeedId] = useState<string | null>(null);
+  const [refreshKey, setRefreshKey] = useState<number>(0);
 
   // Get all feeds (no longer filtered by network since feeds are always on Flare)
   const allFeeds = feeds;
@@ -512,15 +576,20 @@ export default function MonitorPage() {
         sourceChainId,
         feed.priceRelayAddress  // Pass relay address for relay feeds
       );
-      
-      // Refresh feeds data after successful update
-      if (progress.step === 'success') {
-        refresh();
-      }
+      // Always refetch on-chain state after the update flow completes.
+      // (updateFeed updates contracts, not feeds.json)
+      setRefreshKey(Date.now());
     } catch (error) {
       console.error('Update failed:', error);
     }
   };
+
+  // Also refetch immediately when we hit a success state (even before the modal is closed).
+  useEffect(() => {
+    if (progress.step === 'success') {
+      setRefreshKey(Date.now());
+    }
+  }, [progress.step]);
 
   const handleCloseModal = () => {
     if (isUpdating) {
@@ -597,6 +666,7 @@ export default function MonitorPage() {
                   chainId={chainId}
                   onUpdateClick={() => handleUpdateFeed(feed)}
                   isUpdating={isUpdating && updatingFeedId === feed.id}
+                  refreshKey={refreshKey}
                 />
               );
             })}

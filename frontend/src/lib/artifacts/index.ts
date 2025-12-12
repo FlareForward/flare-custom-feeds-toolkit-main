@@ -11,3 +11,7 @@ export {
 
 // Phase 2: Cross-chain relay support
 export { PRICE_RELAY_ABI, PRICE_RELAY_BYTECODE } from './PriceRelay';
+export {
+  CROSSCHAIN_POOL_PRICE_CUSTOM_FEED_ABI,
+  CROSSCHAIN_POOL_PRICE_CUSTOM_FEED_BYTECODE,
+} from './CrossChainPoolPriceCustomFeed';

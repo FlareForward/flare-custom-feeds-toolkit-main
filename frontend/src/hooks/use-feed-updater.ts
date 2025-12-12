@@ -232,6 +232,10 @@ interface UpdateProgress {
   message: string;
   elapsed?: number;
   txHash?: string;
+  // Useful tx hashes for UX/debugging
+  relayTxHash?: string;
+  attestationTxHash?: string;
+  updateTxHash?: string;
   error?: string;
 }
 
@@ -381,10 +385,103 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
           }
         }
 
-        // 3. Call PriceRelay contract on Flare
+        // Get a FRESH wallet client for Flare (after potential chain switches)
+        const flareWalletClient = await getWalletClient(wagmiConfig, { chainId: 14 });
+        if (!flareWalletClient) {
+          throw new Error('Failed to get Flare wallet client. Please ensure your wallet is connected to Flare.');
+        }
+
+        // Create Flare client
+        const flareClient = createPublicClient({
+          chain: flare,
+          transport: http(),
+        });
+
+        // 3. Relay preflight + one-time enable (owner-only)
+        // This avoids confusing relayPrice reverts when chain/pool isn't enabled yet.
+        updateProgress('checking', 'Checking PriceRelay configuration on Flare...');
+
+        const [isActive, isChainEnabled, isPoolEnabled, secondsUntilNext] = await Promise.all([
+          flareClient.readContract({
+            address: priceRelayAddress!,
+            abi: PRICE_RELAY_ABI,
+            functionName: 'isActive',
+          }),
+          flareClient.readContract({
+            address: priceRelayAddress!,
+            abi: PRICE_RELAY_ABI,
+            functionName: 'supportedChains',
+            args: [BigInt(priceData.chainId)],
+          }),
+          flareClient.readContract({
+            address: priceRelayAddress!,
+            abi: PRICE_RELAY_ABI,
+            functionName: 'enabledPools',
+            args: [BigInt(priceData.chainId), priceData.poolAddress as `0x${string}`],
+          }),
+          flareClient.readContract({
+            address: priceRelayAddress!,
+            abi: PRICE_RELAY_ABI,
+            functionName: 'timeUntilNextRelay',
+            args: [BigInt(priceData.chainId), priceData.poolAddress as `0x${string}`],
+          }),
+        ]);
+
+        if (!isActive) {
+          throw new Error('PriceRelay is paused on Flare. The relay owner must unpause it.');
+        }
+
+        // Enable chain if needed (owner-only)
+        if (!isChainEnabled) {
+          updateProgress('enabling-pool', `Enabling source chain ${priceData.chainId} on PriceRelay...`);
+          try {
+            const enableChainHash = await flareWalletClient.writeContract({
+              address: priceRelayAddress!,
+              abi: PRICE_RELAY_ABI,
+              functionName: 'enableChain',
+              args: [BigInt(priceData.chainId)],
+            });
+            await flareClient.waitForTransactionReceipt({ hash: enableChainHash });
+          } catch (e) {
+            throw new Error(
+              `PriceRelay chain ${priceData.chainId} is not enabled and this wallet cannot enable it (owner-only). ` +
+              `Deployer/owner must call enableChain(${priceData.chainId}).`
+            );
+          }
+        }
+
+        // Enable pool if needed (owner-only)
+        if (!isPoolEnabled) {
+          updateProgress('enabling-pool', `Enabling pool on PriceRelay (token binding)...`);
+          try {
+            const enablePoolHash = await flareWalletClient.writeContract({
+              address: priceRelayAddress!,
+              abi: PRICE_RELAY_ABI,
+              functionName: 'enablePool',
+              args: [
+                BigInt(priceData.chainId),
+                priceData.poolAddress as `0x${string}`,
+                priceData.token0 as `0x${string}`,
+                priceData.token1 as `0x${string}`,
+              ],
+            });
+            await flareClient.waitForTransactionReceipt({ hash: enablePoolHash });
+          } catch (e) {
+            throw new Error(
+              `Pool is not enabled on PriceRelay and this wallet cannot enable it (owner-only). ` +
+              `Owner must call enablePool(chainId, pool, token0, token1).`
+            );
+          }
+        }
+
+        if (Number(secondsUntilNext) > 0) {
+          throw new Error(`Relay interval not elapsed yet. Try again in ${Number(secondsUntilNext)}s.`);
+        }
+
+        // 4. Call PriceRelay contract on Flare
         updateProgress('relaying-price', `Relaying price to Flare (from ${sourceChain?.name})...`);
 
-        const relayHash = await walletClient.writeContract({
+        const relayHash = await flareWalletClient.writeContract({
           address: priceRelayAddress!,
           abi: PRICE_RELAY_ABI,
           functionName: 'relayPrice',
@@ -401,18 +498,15 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
           ],
         });
 
-        updateProgress('relaying-price', 'Waiting for relay confirmation...', { txHash: relayHash });
-
-        // Create Flare client
-        const flareClient = createPublicClient({
-          chain: flare,
-          transport: http(),
-        });
+        updateProgress('relaying-price', 'Waiting for relay confirmation...', { txHash: relayHash, relayTxHash: relayHash });
 
         const relayReceipt = await flareClient.waitForTransactionReceipt({ hash: relayHash });
         
         if (relayReceipt.status === 'reverted') {
-          throw new Error('Relay transaction reverted. Pool may not be enabled or tokens may not match.');
+          throw new Error(
+            'Relay transaction reverted. Common causes: relayer not authorized, chain/pool not enabled, ' +
+            'token mismatch (token binding), relay interval not elapsed, stale/future timestamp, or deviation check.'
+          );
         }
 
         recordTxHash = relayHash;
@@ -741,6 +835,11 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
         args: [requestBytes],
         value: fee,
       });
+      
+      updateProgress('requesting-attestation', 'Attestation request submitted. Waiting for confirmation...', {
+        txHash: attestHash,
+        attestationTxHash: attestHash,
+      });
 
       const attestReceipt = await flareClient.waitForTransactionReceipt({ hash: attestHash });
 
@@ -888,7 +987,7 @@ export function useFeedUpdater(): UseFeedUpdaterResult {
       }
 
       // Success!
-      updateProgress('success', 'Feed updated successfully!', { txHash: updateHash });
+      updateProgress('success', 'Feed updated successfully!', { txHash: updateHash, updateTxHash: updateHash });
 
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';

@@ -45,6 +45,10 @@ contract PriceRelay {
     
     /// @notice Maximum price deviation allowed (basis points) - 50%
     uint256 public constant MAX_DEVIATION_BPS = 5000;
+
+    /// @notice Allowed source timestamp skew into the future (seconds)
+    /// @dev Different chains can have slight clock drift; allow small skew.
+    uint256 public constant MAX_FUTURE_SKEW = 600; // 10 minutes
     
     // ==================== Pool Configuration ====================
     
@@ -163,11 +167,19 @@ contract PriceRelay {
         // SECURITY: Token binding check - tokens must match what was registered
         require(token0 == config.token0 && token1 == config.token1, "Token mismatch");
         
-        // SECURITY: Future timestamp rejection - can't relay prices from the future
-        require(sourceTimestamp <= block.timestamp, "Future timestamp");
-        
-        // SECURITY: Freshness check - price data can't be too old
-        require(block.timestamp - sourceTimestamp <= maxPriceAge, "Price data too old");
+        // SECURITY: Timestamp skew + freshness check
+        // Allow small skew into the future to account for cross-chain clock drift.
+        if (sourceTimestamp > block.timestamp) {
+            require(
+                sourceTimestamp - block.timestamp <= MAX_FUTURE_SKEW,
+                "Future timestamp"
+            );
+        } else {
+            require(
+                block.timestamp - sourceTimestamp <= maxPriceAge,
+                "Price data too old"
+            );
+        }
         
         // SECURITY: Monotonicity - block numbers must strictly increase
         require(sourceBlockNumber > config.lastBlockNumber, "Stale block number");
@@ -178,9 +190,9 @@ contract PriceRelay {
             "Relay interval not elapsed"
         );
         
-        // SECURITY: Deviation check (skip on first relay when lastSqrtPriceX96 is 0)
+        // SECURITY: Deviation check on *actual price* (not sqrt)
         if (config.lastSqrtPriceX96 > 0) {
-            uint256 deviation = _calculateDeviation(config.lastSqrtPriceX96, sqrtPriceX96);
+            uint256 deviation = _calculatePriceDeviationBps(config.lastSqrtPriceX96, uint256(sqrtPriceX96));
             require(deviation <= MAX_DEVIATION_BPS, "Price deviation too high");
         }
         
@@ -208,15 +220,81 @@ contract PriceRelay {
     // ==================== Internal Functions ====================
     
     /**
-     * @notice Calculate price deviation in basis points
-     * @param oldPrice Previous sqrtPriceX96 value
-     * @param newPrice New sqrtPriceX96 value
-     * @return Deviation in basis points (0-10000)
+     * @notice Calculate price deviation in basis points using the *price* implied by sqrtPriceX96.
+     * @dev Uses FullMath-style mulDiv to avoid overflow when squaring.
      */
-    function _calculateDeviation(uint256 oldPrice, uint256 newPrice) internal pure returns (uint256) {
+    function _calculatePriceDeviationBps(uint256 oldSqrtPriceX96, uint256 newSqrtPriceX96) internal pure returns (uint256) {
+        if (oldSqrtPriceX96 == 0) return 0;
+        uint256 oldPrice = _priceFromSqrtPriceX96(oldSqrtPriceX96);
+        uint256 newPrice = _priceFromSqrtPriceX96(newSqrtPriceX96);
         if (oldPrice == 0) return 0;
         uint256 diff = oldPrice > newPrice ? oldPrice - newPrice : newPrice - oldPrice;
         return (diff * 10000) / oldPrice;
+    }
+
+    /**
+     * @notice Convert sqrtPriceX96 to price (token1/token0) as an integer (Q0).
+     * @dev price = (sqrtPriceX96^2) / 2^192.
+     */
+    function _priceFromSqrtPriceX96(uint256 sqrtPriceX96) internal pure returns (uint256) {
+        // 2^192 fits into uint256
+        uint256 denom = 2 ** 192;
+        return _mulDiv(sqrtPriceX96, sqrtPriceX96, denom);
+    }
+
+    /**
+     * @notice Computes floor(a*b/denominator) with full precision.
+     * @dev Adapted from Uniswap V3 Core FullMath.mulDiv.
+     */
+    function _mulDiv(uint256 a, uint256 b, uint256 denominator) internal pure returns (uint256 result) {
+        unchecked {
+            uint256 prod0;
+            uint256 prod1;
+            assembly {
+                let mm := mulmod(a, b, not(0))
+                prod0 := mul(a, b)
+                prod1 := sub(sub(mm, prod0), lt(mm, prod0))
+            }
+
+            if (prod1 == 0) {
+                require(denominator > 0, "Div by zero");
+                assembly {
+                    result := div(prod0, denominator)
+                }
+                return result;
+            }
+
+            require(denominator > prod1, "Overflow");
+
+            uint256 remainder;
+            assembly {
+                remainder := mulmod(a, b, denominator)
+                prod1 := sub(prod1, gt(remainder, prod0))
+                prod0 := sub(prod0, remainder)
+            }
+
+            // Factor powers of two out of denominator
+            uint256 twos = denominator & (~denominator + 1);
+            assembly {
+                denominator := div(denominator, twos)
+                prod0 := div(prod0, twos)
+                twos := add(div(sub(0, twos), twos), 1)
+            }
+
+            prod0 |= prod1 * twos;
+
+            // Compute inverse of denominator mod 2^256
+            uint256 inv = (3 * denominator) ^ 2;
+            inv *= 2 - denominator * inv; // inverse mod 2^8
+            inv *= 2 - denominator * inv; // inverse mod 2^16
+            inv *= 2 - denominator * inv; // inverse mod 2^32
+            inv *= 2 - denominator * inv; // inverse mod 2^64
+            inv *= 2 - denominator * inv; // inverse mod 2^128
+            inv *= 2 - denominator * inv; // inverse mod 2^256
+
+            result = prod0 * inv;
+            return result;
+        }
     }
     
     // ==================== Relayer Management ====================

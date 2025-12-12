@@ -34,6 +34,7 @@ import type { SourceChain } from '@/lib/types';
 import Link from 'next/link';
 import { PRICE_RECORDER_ABI, PRICE_RECORDER_BYTECODE } from '@/lib/artifacts/PriceRecorder';
 import { POOL_PRICE_CUSTOM_FEED_ABI, POOL_PRICE_CUSTOM_FEED_BYTECODE, CONTRACT_REGISTRY, CONTRACT_REGISTRY_ABI } from '@/lib/artifacts/PoolPriceCustomFeed';
+import { CROSSCHAIN_POOL_PRICE_CUSTOM_FEED_ABI, CROSSCHAIN_POOL_PRICE_CUSTOM_FEED_BYTECODE } from '@/lib/artifacts/CrossChainPoolPriceCustomFeed';
 import { getAddress, createPublicClient, http } from 'viem';
 import { PRICE_RELAY_ABI, PRICE_RELAY_BYTECODE } from '@/lib/artifacts/PriceRelay';
 import { isRelayChain } from '@/lib/chains';
@@ -384,28 +385,43 @@ export default function DeployPage() {
         throw new Error('FdcVerification address not found in registry');
       }
 
-      toast.info('Deploying PoolPriceCustomFeed on Flare...', {
-        description: `${feedAlias} for pool on ${sourceChain?.name}`,
-      });
+      toast.info(
+        isRelaySourceChain
+          ? 'Deploying CrossChainPoolPriceCustomFeed on Flare...'
+          : 'Deploying PoolPriceCustomFeed on Flare...',
+        { description: `${feedAlias} for pool on ${sourceChain?.name}` }
+      );
 
       // Properly checksum all addresses
-      const checksummedRecorder = getAddress(selectedRecorder);
       const checksummedPool = getAddress(poolAddress);
       const checksummedFdc = getAddress(fdcVerificationAddress);
+      const checksummedRecorder = !isRelaySourceChain ? getAddress(selectedRecorder) : undefined;
+      const checksummedRelay = isRelaySourceChain ? getAddress(selectedRelay) : undefined;
 
-      // Deploy the PoolPriceCustomFeed contract on Flare using the fresh wallet client
+      // Deploy the correct feed contract on Flare using the fresh wallet client
       const hash = await flareWalletClient.deployContract({
-        abi: POOL_PRICE_CUSTOM_FEED_ABI,
-        bytecode: POOL_PRICE_CUSTOM_FEED_BYTECODE,
-        args: [
-          checksummedRecorder,  // _priceRecorder (on source chain)
-          checksummedPool,      // _poolAddress (on source chain)
-          feedAlias,            // _feedName
-          checksummedFdc,       // _fdcVerificationAddress
-          token0Dec,            // _token0Decimals
-          token1Dec,            // _token1Decimals
-          invertPrice,          // _invertPrice
-        ],
+        abi: isRelaySourceChain ? CROSSCHAIN_POOL_PRICE_CUSTOM_FEED_ABI : POOL_PRICE_CUSTOM_FEED_ABI,
+        bytecode: isRelaySourceChain ? CROSSCHAIN_POOL_PRICE_CUSTOM_FEED_BYTECODE : POOL_PRICE_CUSTOM_FEED_BYTECODE,
+        args: isRelaySourceChain
+          ? [
+              checksummedRelay!,      // _priceRelay (on Flare)
+              BigInt(sourceChainId),  // _sourceChainId
+              checksummedPool,        // _poolAddress (on source chain)
+              feedAlias,              // _feedName
+              checksummedFdc,         // _fdcVerificationAddress
+              token0Dec,              // _token0Decimals
+              token1Dec,              // _token1Decimals
+              invertPrice,            // _invertPrice
+            ]
+          : [
+              checksummedRecorder!,   // _priceRecorder (on source chain)
+              checksummedPool,        // _poolAddress (on source chain)
+              feedAlias,              // _feedName
+              checksummedFdc,         // _fdcVerificationAddress
+              token0Dec,              // _token0Decimals
+              token1Dec,              // _token1Decimals
+              invertPrice,            // _invertPrice
+            ],
         account: address,
       });
 
